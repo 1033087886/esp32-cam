@@ -4,7 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoWebsockets.h>
-#include <tiny_websockets/network/esp32/esp32_tcp.hpp>
+#include <tiny_websockets/network/tcp_client.hpp>
 #include "esp_camera.h"
 #include <time.h>
 #include <string.h>
@@ -12,6 +12,8 @@
 #include <memory>
 #include "esp_netif.h"
 #include "lwip/ip6_addr.h"
+#include "lwip/sockets.h"
+#include "esp_tls.h"
 #if __has_include(<esp32/spiram.h>)
 #include <esp32/spiram.h>
 #define HAS_SPIRAM_CHIP_API 1
@@ -25,14 +27,156 @@
 
 using namespace websockets;
 
-// ArduinoWebsockets on ESP32 does not always propagate insecure mode to the
-// internal WiFiClientSecure when using wss:// URL.
-// Use an explicit secured TCP client and force setInsecure() here.
-class InsecureSecuredEsp32TcpClient : public websockets::network::SecuredEsp32TcpClient {
+class EspTlsSecuredTcpClient : public websockets::network::TcpClient {
 public:
-  InsecureSecuredEsp32TcpClient() : websockets::network::SecuredEsp32TcpClient() {
-    this->client.setInsecure();
+  explicit EspTlsSecuredTcpClient(const char* caCert)
+    : _tls(nullptr), _connected(false), _caCert(caCert) {
+    _keepAlive.keep_alive_enable = true;
+    _keepAlive.keep_alive_idle = 5;
+    _keepAlive.keep_alive_interval = 5;
+    _keepAlive.keep_alive_count = 3;
   }
+
+  bool connect(const WSString& host, int port) override {
+    close();
+    _host = host;
+
+    esp_tls_cfg_t cfg = {};
+    cfg.timeout_ms = 10000;
+    cfg.keep_alive_cfg = &_keepAlive;
+    cfg.common_name = _host.c_str();
+
+    if (_caCert != nullptr && strlen(_caCert) > 0) {
+      cfg.cacert_buf = reinterpret_cast<const unsigned char*>(_caCert);
+      cfg.cacert_bytes = strlen(_caCert) + 1;
+    }
+
+    _tls = esp_tls_init();
+    if (_tls == nullptr) {
+      return false;
+    }
+
+    int ret = esp_tls_conn_new_sync(_host.c_str(), _host.length(), port, &cfg, _tls);
+    if (ret != 1) {
+      esp_tls_conn_destroy(_tls);
+      _tls = nullptr;
+      _connected = false;
+      return false;
+    }
+
+    _connected = true;
+    return true;
+  }
+
+  bool poll() override {
+    if (!_connected || _tls == nullptr) return false;
+
+    int avail = esp_tls_get_bytes_avail(_tls);
+    if (avail > 0) return true;
+
+    int sockfd = -1;
+    if (esp_tls_get_conn_sockfd(_tls, &sockfd) != ESP_OK || sockfd < 0) return false;
+
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(sockfd, &readSet);
+    timeval tv = {};
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+
+    int rc = lwip_select(sockfd + 1, &readSet, nullptr, nullptr, &tv);
+    return rc > 0;
+  }
+
+  bool available() override {
+    return _connected && _tls != nullptr;
+  }
+
+  void send(const WSString& data) override {
+    send(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
+  }
+
+  void send(const WSString&& data) override {
+    send(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
+  }
+
+  void send(const uint8_t* data, const uint32_t len) override {
+    if (!_connected || _tls == nullptr || data == nullptr || len == 0) return;
+
+    uint32_t total = 0;
+    while (total < len) {
+      int written = esp_tls_conn_write(
+        _tls,
+        reinterpret_cast<const char*>(data + total),
+        static_cast<size_t>(len - total)
+      );
+      if (written <= 0) {
+        _connected = false;
+        return;
+      }
+      total += static_cast<uint32_t>(written);
+    }
+  }
+
+  WSString readLine() override {
+    WSString line;
+    if (!_connected || _tls == nullptr) return line;
+
+    const uint32_t timeoutMs = 8000;
+    unsigned long start = millis();
+    while (_connected && millis() - start < timeoutMs) {
+      char ch = 0;
+      int ret = esp_tls_conn_read(_tls, &ch, 1);
+      if (ret == 1) {
+        line += ch;
+        if (ch == '\n') {
+          break;
+        }
+      } else if (ret == 0) {
+        _connected = false;
+        break;
+      } else {
+        delay(1);
+      }
+    }
+    return line;
+  }
+
+  uint32_t read(uint8_t* buffer, const uint32_t len) override {
+    if (!_connected || _tls == nullptr || buffer == nullptr || len == 0) return 0;
+    int ret = esp_tls_conn_read(_tls, reinterpret_cast<char*>(buffer), len);
+    if (ret <= 0) {
+      if (ret == 0) {
+        _connected = false;
+      }
+      return 0;
+    }
+    return static_cast<uint32_t>(ret);
+  }
+
+  void close() override {
+    if (_tls != nullptr) {
+      esp_tls_conn_destroy(_tls);
+      _tls = nullptr;
+    }
+    _connected = false;
+  }
+
+  ~EspTlsSecuredTcpClient() override {
+    close();
+  }
+
+protected:
+  int getSocket() const override {
+    return -1;
+  }
+
+private:
+  esp_tls_t* _tls;
+  bool _connected;
+  const char* _caCert;
+  WSString _host;
+  tls_keep_alive_cfg_t _keepAlive;
 };
 
 void connectWiFi();
@@ -112,16 +256,65 @@ const unsigned long wifiReconnectInterval = 5000UL;
 const unsigned long mqttReconnectInterval = 5000UL;
 const unsigned long mqttHeartbeatInterval = 30000UL;
 const unsigned long wsReconnectInterval = 3000UL;
-const unsigned long streamInterval = 66UL;  // about 5-6 FPS (better for CF relay)
+const unsigned long streamInterval = 100UL;  // ~10 FPS target (quality-first)
+const unsigned long streamSendWarmupMs = 1000UL;
+const unsigned long streamStatsInterval = 5000UL;
+const size_t streamPreferredMaxFrameBytes = 85000;
+const uint8_t streamJpegQualityPsram = 8;      // smaller value => higher quality/larger frame
+const uint8_t streamJpegQualityNoPsram = 12;
+const uint8_t streamJpegQualityMax = 12;
 const unsigned long wsPingInterval = 15000UL;
 const unsigned long ipv6RetryInterval = 4000UL;
 const uint8_t ipv6MaxRetry = 15;
+const framesize_t streamFrameSizePsram = FRAMESIZE_VGA;
+const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
 
 // Stream URL copied from the HTML reference file
 const char* streamWsUrl = "wss://esp.rose980.eu.cc:443/esp32";
 const char* streamWsHost = "esp.rose980.eu.cc";
 const uint16_t streamWsPort = 443;
 const char* streamWsPath = "/esp32";
+const char* streamWsCaCert = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIG1TCCBL2gAwIBAgIQbFWr29AHksedBwzYEZ7WvzANBgkqhkiG9w0BAQwFADCB
+iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl
+cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV
+BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMjAw
+MTMwMDAwMDAwWhcNMzAwMTI5MjM1OTU5WjBLMQswCQYDVQQGEwJBVDEQMA4GA1UE
+ChMHWmVyb1NTTDEqMCgGA1UEAxMhWmVyb1NTTCBSU0EgRG9tYWluIFNlY3VyZSBT
+aXRlIENBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAhmlzfqO1Mdgj
+4W3dpBPTVBX1AuvcAyG1fl0dUnw/MeueCWzRWTheZ35LVo91kLI3DDVaZKW+TBAs
+JBjEbYmMwcWSTWYCg5334SF0+ctDAsFxsX+rTDh9kSrG/4mp6OShubLaEIUJiZo4
+t873TuSd0Wj5DWt3DtpAG8T35l/v+xrN8ub8PSSoX5Vkgw+jWf4KQtNvUFLDq8mF
+WhUnPL6jHAADXpvs4lTNYwOtx9yQtbpxwSt7QJY1+ICrmRJB6BuKRt/jfDJF9Jsc
+RQVlHIxQdKAJl7oaVnXgDkqtk2qddd3kCDXd74gv813G91z7CjsGyJ93oJIlNS3U
+gFbD6V54JMgZ3rSmotYbz98oZxX7MKbtCm1aJ/q+hTv2YK1yMxrnfcieKmOYBbFD
+hnW5O6RMA703dBK92j6XRN2EttLkQuujZgy+jXRKtaWMIlkNkWJmOiHmErQngHvt
+iNkIcjJumq1ddFX4iaTI40a6zgvIBtxFeDs2RfcaH73er7ctNUUqgQT5rFgJhMmF
+x76rQgB5OZUkodb5k2ex7P+Gu4J86bS15094UuYcV09hVeknmTh5Ex9CBKipLS2W
+2wKBakf+aVYnNCU6S0nASqt2xrZpGC1v7v6DhuepyyJtn3qSV2PoBiU5Sql+aARp
+wUibQMGm44gjyNDqDlVp+ShLQlUH9x8CAwEAAaOCAXUwggFxMB8GA1UdIwQYMBaA
+FFN5v1qqK0rPVIDh2JvAnfKyA2bLMB0GA1UdDgQWBBTI2XhootkZaNU9ct5fCj7c
+tYaGpjAOBgNVHQ8BAf8EBAMCAYYwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHSUE
+FjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwIgYDVR0gBBswGTANBgsrBgEEAbIxAQIC
+TjAIBgZngQwBAgEwUAYDVR0fBEkwRzBFoEOgQYY/aHR0cDovL2NybC51c2VydHJ1
+c3QuY29tL1VTRVJUcnVzdFJTQUNlcnRpZmljYXRpb25BdXRob3JpdHkuY3JsMHYG
+CCsGAQUFBwEBBGowaDA/BggrBgEFBQcwAoYzaHR0cDovL2NydC51c2VydHJ1c3Qu
+Y29tL1VTRVJUcnVzdFJTQUFkZFRydXN0Q0EuY3J0MCUGCCsGAQUFBzABhhlodHRw
+Oi8vb2NzcC51c2VydHJ1c3QuY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAVDwoIzQDV
+ercT0eYqZjBNJ8VNWwVFlQOtZERqn5iWnEVaLZZdzxlbvz2Fx0ExUNuUEgYkIVM4
+YocKkCQ7hO5noicoq/DrEYH5IuNcuW1I8JJZ9DLuB1fYvIHlZ2JG46iNbVKA3ygA
+Ez86RvDQlt2C494qqPVItRjrz9YlJEGT0DrttyApq0YLFDzf+Z1pkMhh7c+7fXeJ
+qmIhfJpduKc8HEQkYQQShen426S3H0JrIAbKcBCiyYFuOhfyvuwVCFDfFvrjADjd
+4jX1uQXd161IyFRbm89s2Oj5oU1wDYz5sx+hoCuh6lSs+/uPuWomIq3y1GDFNafW
++LsHBU16lQo5Q2yh25laQsKRgyPmMpHJ98edm6y2sHUabASmRHxvGiuwwE25aDU0
+2SAeepyImJ2CzB80YG7WxlynHqNhpE7xfC7PzQlLgmfEHdU+tHFeQazRQnrFkW2W
+kqRGIq7cKRnyypvjPMkjeiV9lRdAM9fSJvsB3svUuu1coIG1xxI1yegoGM4r5QP4
+RGIVvYaiI76C0djoSbQ/dkIUUXQuB8AL5jyH34g3BZaaXyvpmnV4ilppMXVAnAYG
+ON51WhJ6W0xNdNJwzYASZYH+tmCWI+N60Gv2NNMGHwMZ7e9bXgzUCZH5FaBFDGR5
+S9VWqHB73Q+OyIVvIbKYcSc2w/aSuFKGSA==
+-----END CERTIFICATE-----
+)EOF";
 
 // ESP32-CAM (AI Thinker) pins
 #define PWDN_GPIO_NUM 32
@@ -153,7 +346,8 @@ const uint8_t flashLedChannel = 7;
 WiFiClient mqttPlainClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttClient(mqttPlainClient);
-WebsocketsClient wsClient(std::make_shared<InsecureSecuredEsp32TcpClient>());
+WebsocketsClient wsClient(std::make_shared<EspTlsSecuredTcpClient>(streamWsCaCert));
+bool wsConnected = false;
 bool mqttUsingInsecure = false;
 
 String topicCmdLight;
@@ -168,9 +362,15 @@ unsigned long lastMqttConnectAttempt = 0;
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastWsConnectAttempt = 0;
 unsigned long lastFrameTime = 0;
+unsigned long lastStreamStatTime = 0;
 unsigned long lastWsPingTime = 0;
 unsigned long wsConnectedAt = 0;
 unsigned long wsReconnectCount = 0;
+unsigned long streamFramesSent = 0;
+unsigned long streamFramesDropped = 0;
+unsigned long streamBytesSent = 0;
+unsigned long wsBusyDropCount = 0;
+uint8_t currentJpegQuality = 0;
 bool wifiWasConnected = false;
 bool hasIPv6 = false;
 String currentIPv6;
@@ -206,16 +406,24 @@ void setup() {
   wsClient.onEvent([](WebsocketsEvent event, String data) {
     (void)data;
     if (event == WebsocketsEvent::ConnectionOpened) {
+      wsConnected = true;
       wsConnectedAt = millis();
       lastWsPingTime = millis();
+      lastStreamStatTime = millis();
+      streamFramesSent = 0;
+      streamFramesDropped = 0;
+      streamBytesSent = 0;
+      wsBusyDropCount = 0;
       Serial.println("[WS] 推流连接成功");
     } else if (event == WebsocketsEvent::ConnectionClosed) {
+      wsConnected = false;
       unsigned long aliveMs = (wsConnectedAt > 0) ? (millis() - wsConnectedAt) : 0;
       Serial.printf("[WS] 推流连接断开，在线时长=%lu ms, RSSI=%d\n", aliveMs, WiFi.RSSI());
     }
   });
   wsClient.addHeader("Origin", "https://esp.rose980.eu.cc");
   wsClient.addHeader("User-Agent", "ESP32-CAM");
+
   connectWiFi();
   if (WiFi.status() == WL_CONNECTED) {
     wifiWasConnected = true;
@@ -239,9 +447,8 @@ void loop() {
     if (wifiWasConnected) {
       wifiWasConnected = false;
       Serial.println("[WiFi] 已断开，等待重连");
-      if (wsClient.available()) {
-        wsClient.close();
-      }
+      wsConnected = false;
+      if (wsClient.available()) wsClient.close();
     }
 
     if (now - lastWifiRetryTime >= wifiReconnectInterval) {
@@ -302,6 +509,7 @@ void loop() {
     if (!wsClient.ping()) {
       Serial.println("[WS] ping 失败，主动重连");
       wsClient.close();
+      wsConnected = false;
     }
     lastWsPingTime = now;
   }
@@ -547,6 +755,7 @@ void connectWiFi() {
 
   Serial.printf("[WiFi] 正在连接 %s\n", ssid);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(ssid, password);
 
   int attempts = 0;
@@ -826,12 +1035,12 @@ bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
+    config.frame_size = streamFrameSizePsram;
+    config.jpeg_quality = streamJpegQualityPsram;
+    config.fb_count = 3;
   } else {
-    config.frame_size = FRAMESIZE_QQVGA;
-    config.jpeg_quality = 16;
+    config.frame_size = streamFrameSizeNoPsram;
+    config.jpeg_quality = streamJpegQualityNoPsram;
     config.fb_count = 1;
   }
 
@@ -848,13 +1057,27 @@ bool initCamera() {
     return false;
   }
 
+  currentJpegQuality = static_cast<uint8_t>(config.jpeg_quality);
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor) {
+    sensor->set_quality(sensor, currentJpegQuality);
+    sensor->set_contrast(sensor, 2);
+    sensor->set_sharpness(sensor, 2);
+    sensor->set_denoise(sensor, 0);
+    sensor->set_gainceiling(sensor, GAINCEILING_8X);
+    sensor->set_aec2(sensor, 1);
+    sensor->set_dcw(sensor, 0);
+    sensor->set_lenc(sensor, 1);
     sensor->set_brightness(sensor, 0);
     sensor->set_saturation(sensor, 0);
   }
 
-  Serial.println("[CAM] 初始化成功");
+  Serial.printf(
+    "[CAM] 初始化成功 frame=%d quality=%d fb_count=%d\n",
+    static_cast<int>(config.frame_size),
+    config.jpeg_quality,
+    config.fb_count
+  );
   return true;
 }
 
@@ -865,31 +1088,95 @@ void connectStreamWs() {
   Serial.println("[WS] 正在连接推流端点: " + String(streamWsUrl));
   Serial.printf("[WS] 重连次数: %lu\n", wsReconnectCount);
   Serial.printf("[WS] 连接前可用堆内存: %u\n", ESP.getFreeHeap());
+
   if (!wsClient.connect(streamWsHost, streamWsPort, streamWsPath)) {
+    wsConnected = false;
     Serial.println("[WS] 连接失败");
     Serial.printf("[WS] 连接失败后可用堆内存: %u\n", ESP.getFreeHeap());
   }
 }
 
 void sendStreamFrameIfReady() {
-  if (!wsClient.available()) return;
+  if (!wsClient.available() || !wsConnected) return;
 
   unsigned long now = millis();
   if (now - lastFrameTime < streamInterval) return;
+  if (now - wsConnectedAt < streamSendWarmupMs) return;
+  if (lastStreamStatTime == 0) {
+    lastStreamStatTime = now;
+  }
 
+  unsigned long captureStart = millis();
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("[CAM] 抓帧失败");
     return;
   }
+  unsigned long captureMs = millis() - captureStart;
+  size_t frameBytes = fb->len;
 
-  bool sent = wsClient.sendBinary((const char*)fb->buf, fb->len);
+  bool sent = wsClient.sendBinary(reinterpret_cast<const char*>(fb->buf), fb->len);
+  unsigned long sendMs = millis() - captureStart - captureMs;
   esp_camera_fb_return(fb);
 
   if (!sent) {
-    Serial.println("[WS] 发送帧失败，准备重连");
-    wsClient.close();
+    streamFramesDropped++;
+    wsBusyDropCount++;
+    if (!wsClient.available()) {
+      wsConnected = false;
+    }
+    if (wsBusyDropCount == 1 || (wsBusyDropCount % 50UL) == 0) {
+      Serial.printf(
+        "[WS] 发送忙，丢帧 busy=%lu (capture=%lums send=%lums, frame=%uB)\n",
+        wsBusyDropCount,
+        captureMs,
+        sendMs,
+        (unsigned int)frameBytes
+      );
+    }
     return;
+  }
+
+  wsBusyDropCount = 0;
+  streamFramesSent++;
+  streamBytesSent += frameBytes;
+
+  if (frameBytes > streamPreferredMaxFrameBytes && currentJpegQuality < streamJpegQualityMax) {
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor != nullptr) {
+      currentJpegQuality = static_cast<uint8_t>(currentJpegQuality + 1);
+      if (currentJpegQuality > streamJpegQualityMax) {
+        currentJpegQuality = streamJpegQualityMax;
+      }
+      sensor->set_quality(sensor, currentJpegQuality);
+      Serial.printf(
+        "[CAM] 帧过大=%uB，自动降低码率 quality=%u\n",
+        (unsigned int)frameBytes,
+        currentJpegQuality
+      );
+    }
+  }
+
+  if (now - lastStreamStatTime >= streamStatsInterval) {
+    unsigned long window = now - lastStreamStatTime;
+    float fps = (window > 0) ? (1000.0f * static_cast<float>(streamFramesSent) / static_cast<float>(window)) : 0.0f;
+    float kbps = (window > 0) ? (8.0f * static_cast<float>(streamBytesSent) / static_cast<float>(window)) : 0.0f;
+    Serial.printf(
+      "[WS] 推流统计 fps=%.1f kbps=%.1f sent=%lu drop=%lu busy=%lu q=%u frame=%uB cap=%lums send=%lums\n",
+      fps,
+      kbps,
+      streamFramesSent,
+      streamFramesDropped,
+      wsBusyDropCount,
+      currentJpegQuality,
+      (unsigned int)frameBytes,
+      captureMs,
+      sendMs
+    );
+    lastStreamStatTime = now;
+    streamFramesSent = 0;
+    streamFramesDropped = 0;
+    streamBytesSent = 0;
   }
 
   lastFrameTime = now;
