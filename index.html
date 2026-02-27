@@ -1,0 +1,286 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32-CAM 远程监看</title>
+  <style>
+    :root {
+      --bg: #0f131a;
+      --panel: #17212b;
+      --line: #2a3b4b;
+      --text: #e7f2ff;
+      --muted: #96a8bb;
+      --ok: #00d084;
+      --warn: #ffb020;
+      --bad: #ff4d4f;
+      --accent: #00aaff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 20% 20%, #1a2b3f, var(--bg) 45%);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      padding: 20px;
+    }
+
+    .wrap {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      background: rgba(23, 33, 43, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+
+    .k {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .v {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    #statusValue.ok { color: var(--ok); }
+    #statusValue.warn { color: var(--warn); }
+    #statusValue.bad { color: var(--bad); }
+
+    .viewer {
+      background: rgba(23, 33, 43, 0.8);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    #videoStream {
+      width: auto;
+      height: auto;
+      max-width: 100%;
+      max-height: 80vh;
+      display: block;
+      margin: 0 auto;
+      border: 2px solid var(--accent);
+      border-radius: 8px;
+      box-shadow: 0 0 18px rgba(0, 170, 255, 0.3);
+      background: #0b0f14;
+      object-fit: contain;
+    }
+
+    .actions {
+      margin-top: 12px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      background: #2585ff;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    button:hover { filter: brightness(1.08); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>ESP32-CAM 远程监看</h1>
+
+    <div class="meta">
+      <div class="card">
+        <div class="k">连接状态</div>
+        <div class="v warn" id="statusValue">初始化中</div>
+      </div>
+      <div class="card">
+        <div class="k">实时 FPS（本地统计）</div>
+        <div class="v" id="fpsValue">0.0</div>
+      </div>
+      <div class="card">
+        <div class="k">累计接收帧</div>
+        <div class="v" id="frameValue">0</div>
+      </div>
+      <div class="card">
+        <div class="k">重连次数</div>
+        <div class="v" id="reconnectValue">0</div>
+      </div>
+      <div class="card">
+        <div class="k">当前分辨率</div>
+        <div class="v" id="resolutionValue">-</div>
+      </div>
+    </div>
+
+    <div class="viewer">
+      <img id="videoStream" alt="等待视频流" />
+      <div class="actions">
+        <button id="reconnectBtn" type="button">手动重连</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const wsUrl = "wss://esp.rose980.eu.cc:443/viewer";
+
+    const statusValue = document.getElementById("statusValue");
+    const fpsValue = document.getElementById("fpsValue");
+    const frameValue = document.getElementById("frameValue");
+    const reconnectValue = document.getElementById("reconnectValue");
+    const resolutionValue = document.getElementById("resolutionValue");
+    const videoStream = document.getElementById("videoStream");
+    const reconnectBtn = document.getElementById("reconnectBtn");
+
+    let ws = null;
+    let reconnectTimer = null;
+    let reconnectCount = 0;
+    let objectUrl = null;
+
+    let totalFrames = 0;
+    let secondFrames = 0;
+    let secondStart = performance.now();
+    let fpsTimer = null;
+
+    function setStatus(text, level) {
+      statusValue.textContent = text;
+      statusValue.className = `v ${level}`;
+    }
+
+    function updateFpsTick() {
+      const now = performance.now();
+      const dt = now - secondStart;
+      if (dt <= 0) return;
+      const fps = (secondFrames * 1000) / dt;
+      fpsValue.textContent = fps.toFixed(1);
+      secondFrames = 0;
+      secondStart = now;
+    }
+
+    function startFpsTimer() {
+      if (fpsTimer) return;
+      fpsTimer = setInterval(updateFpsTick, 1000);
+    }
+
+    function stopFpsTimer() {
+      if (!fpsTimer) return;
+      clearInterval(fpsTimer);
+      fpsTimer = null;
+      fpsValue.textContent = "0.0";
+      secondFrames = 0;
+      secondStart = performance.now();
+    }
+
+    function cleanupSocket() {
+      if (ws) {
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        try { ws.close(); } catch (_) {}
+      }
+      ws = null;
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect(true);
+      }, 2500);
+    }
+
+    function connect(isAuto = false) {
+      cleanupSocket();
+      if (isAuto) {
+        reconnectCount += 1;
+        reconnectValue.textContent = String(reconnectCount);
+      }
+
+      setStatus("连接中", "warn");
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "blob";
+
+      ws.onopen = () => {
+        setStatus("已连接，等待视频帧", "ok");
+        startFpsTimer();
+      };
+
+      ws.onmessage = (event) => {
+        if (!(event.data instanceof Blob)) return;
+
+        if (objectUrl) {
+          URL.revokeObjectURL(objectUrl);
+        }
+        objectUrl = URL.createObjectURL(event.data);
+        videoStream.src = objectUrl;
+
+        totalFrames += 1;
+        secondFrames += 1;
+        frameValue.textContent = String(totalFrames);
+      };
+
+      ws.onclose = () => {
+        setStatus("连接断开，自动重连中", "bad");
+        stopFpsTimer();
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        setStatus("连接错误", "bad");
+      };
+    }
+
+    reconnectBtn.addEventListener("click", () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      connect(false);
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (fpsTimer) clearInterval(fpsTimer);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      cleanupSocket();
+    });
+
+    videoStream.onload = () => {
+      const w = videoStream.naturalWidth;
+      const h = videoStream.naturalHeight;
+      if (w > 0 && h > 0) {
+        resolutionValue.textContent = `${w} x ${h}`;
+        videoStream.style.width = `${w}px`;
+        videoStream.style.height = `${h}px`;
+      }
+    };
+
+    connect(false);
+  </script>
+</body>
+</html>
