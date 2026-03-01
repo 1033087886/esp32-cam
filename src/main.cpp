@@ -256,24 +256,27 @@ const unsigned long wifiReconnectInterval = 5000UL;
 const unsigned long mqttReconnectInterval = 5000UL;
 const unsigned long mqttHeartbeatInterval = 30000UL;
 const unsigned long wsReconnectInterval = 3000UL;
-const unsigned long streamInterval = 100UL;  // ~10 FPS target (quality-first)
+const unsigned long streamInterval = 66UL;   // ~15 FPS target (fps-first)
 const unsigned long streamSendWarmupMs = 1000UL;
 const unsigned long streamStatsInterval = 5000UL;
-const size_t streamPreferredMaxFrameBytes = 85000;
-const uint8_t streamJpegQualityPsram = 8;      // smaller value => higher quality/larger frame
-const uint8_t streamJpegQualityNoPsram = 12;
-const uint8_t streamJpegQualityMax = 12;
+const size_t streamPreferredMaxFrameBytes = 12000;
+const uint8_t streamJpegQualityPsram = 18;     // larger value => lower quality/smaller frame
+const uint8_t streamJpegQualityNoPsram = 24;
+const uint8_t streamJpegQualityMax = 30;
 const unsigned long wsPingInterval = 15000UL;
 const unsigned long ipv6RetryInterval = 4000UL;
 const uint8_t ipv6MaxRetry = 15;
-const framesize_t streamFrameSizePsram = FRAMESIZE_VGA;
-const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
+const framesize_t streamFrameSizePsram = FRAMESIZE_QVGA;
+const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QQVGA;
 
 // Stream URL copied from the HTML reference file
 const char* streamWsUrl = "wss://esp.rose980.eu.cc:443/esp32";
 const char* streamWsHost = "esp.rose980.eu.cc";
 const uint16_t streamWsPort = 443;
 const char* streamWsPath = "/esp32";
+// Bundle multiple trusted roots so WS TLS works for both:
+// - direct origin mode (ZeroSSL/UserTrust chain)
+// - Cloudflare proxy mode (Google Trust Services chain)
 const char* streamWsCaCert = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIG1TCCBL2gAwIBAgIQbFWr29AHksedBwzYEZ7WvzANBgkqhkiG9w0BAQwFADCB
@@ -313,6 +316,19 @@ kqRGIq7cKRnyypvjPMkjeiV9lRdAM9fSJvsB3svUuu1coIG1xxI1yegoGM4r5QP4
 RGIVvYaiI76C0djoSbQ/dkIUUXQuB8AL5jyH34g3BZaaXyvpmnV4ilppMXVAnAYG
 ON51WhJ6W0xNdNJwzYASZYH+tmCWI+N60Gv2NNMGHwMZ7e9bXgzUCZH5FaBFDGR5
 S9VWqHB73Q+OyIVvIbKYcSc2w/aSuFKGSA==
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
 -----END CERTIFICATE-----
 )EOF";
 
@@ -1060,6 +1076,26 @@ bool initCamera() {
   currentJpegQuality = static_cast<uint8_t>(config.jpeg_quality);
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor) {
+    const uint16_t sensorPid = sensor->id.PID;
+#if defined(OV2640_PID)
+    const bool isOv2640 = (sensorPid == OV2640_PID);
+#else
+    const bool isOv2640 = false;
+#endif
+#if defined(OV3660_PID)
+    const bool isOv3660 = (sensorPid == OV3660_PID);
+#else
+    const bool isOv3660 = false;
+#endif
+
+    if (isOv2640) {
+      Serial.printf("[CAM] 检测到 OV2640 (PID=0x%04x)\n", sensorPid);
+    } else if (isOv3660) {
+      Serial.printf("[CAM] 检测到 OV3660 (PID=0x%04x)\n", sensorPid);
+    } else {
+      Serial.printf("[CAM] 检测到未知传感器 PID=0x%04x\n", sensorPid);
+    }
+
     sensor->set_quality(sensor, currentJpegQuality);
     sensor->set_contrast(sensor, 2);
     sensor->set_sharpness(sensor, 2);
@@ -1070,6 +1106,14 @@ bool initCamera() {
     sensor->set_lenc(sensor, 1);
     sensor->set_brightness(sensor, 0);
     sensor->set_saturation(sensor, 0);
+
+    if (isOv3660) {
+      sensor->set_vflip(sensor, 1);
+      sensor->set_hmirror(sensor, 0);
+      sensor->set_brightness(sensor, 1);
+      sensor->set_saturation(sensor, -1);
+      Serial.println("[CAM] 已应用 OV3660 调优参数");
+    }
   }
 
   Serial.printf(
