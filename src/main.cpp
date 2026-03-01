@@ -29,6 +29,19 @@
 #define GC2145_PID 0x2145
 #endif
 
+#ifndef CAM_FORCE_SENSOR
+#define CAM_FORCE_SENSOR auto
+#endif
+
+#define CAM_STRINGIFY_IMPL(value) #value
+#define CAM_STRINGIFY(value) CAM_STRINGIFY_IMPL(value)
+
+#if __has_include("sensors/private_include/gc2145_settings.h")
+#define HAS_GC2145_DRIVER_HEADER_HINT 1
+#else
+#define HAS_GC2145_DRIVER_HEADER_HINT 0
+#endif
+
 using namespace websockets;
 
 class EspTlsSecuredTcpClient : public websockets::network::TcpClient {
@@ -183,6 +196,13 @@ private:
   tls_keep_alive_cfg_t _keepAlive;
 };
 
+enum class CameraSensorProfile : uint8_t {
+  UNKNOWN = 0,
+  OV2640,
+  OV3660,
+  GC2145
+};
+
 void connectWiFi();
 void doPortalAuth();
 void testInternet();
@@ -209,6 +229,19 @@ void publishAck(const char* msg);
 String extractJsonValue(const String& json, const String& key);
 void printMemoryInfo(const char* stage);
 const char* psramChipSizeText(int chipEnum);
+const char* cameraSensorProfileToString(CameraSensorProfile profile);
+CameraSensorProfile cameraSensorProfileFromPid(uint16_t pid);
+CameraSensorProfile parseForcedSensorProfile(
+  const char* raw,
+  bool* forceEnabled,
+  bool* valueValid,
+  char* normalized,
+  size_t normalizedSize
+);
+const char* pixformatToString(pixformat_t pixformat);
+const char* frameSizeToString(framesize_t frameSize);
+template <typename T>
+bool applySensorSetting(sensor_t* sensor, const char* settingName, T value, int (*setter)(sensor_t*, T));
 
 // WiFi settings
 // const char* ssid = "Keropok";
@@ -1015,7 +1048,138 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+const char* cameraSensorProfileToString(CameraSensorProfile profile) {
+  switch (profile) {
+    case CameraSensorProfile::OV2640: return "OV2640";
+    case CameraSensorProfile::OV3660: return "OV3660";
+    case CameraSensorProfile::GC2145: return "GC2145";
+    default: return "UNKNOWN";
+  }
+}
+
+CameraSensorProfile cameraSensorProfileFromPid(uint16_t pid) {
+  if (pid == OV2640_PID) return CameraSensorProfile::OV2640;
+  if (pid == OV3660_PID) return CameraSensorProfile::OV3660;
+  if (pid == GC2145_PID) return CameraSensorProfile::GC2145;
+  return CameraSensorProfile::UNKNOWN;
+}
+
+CameraSensorProfile parseForcedSensorProfile(
+  const char* raw,
+  bool* forceEnabled,
+  bool* valueValid,
+  char* normalized,
+  size_t normalizedSize
+) {
+  if (forceEnabled != nullptr) *forceEnabled = false;
+  if (valueValid != nullptr) *valueValid = false;
+  if (normalized != nullptr && normalizedSize > 0) {
+    normalized[0] = '\0';
+  }
+
+  const char* source = (raw != nullptr) ? raw : "";
+  char token[24] = {0};
+  size_t writePos = 0;
+
+  for (size_t i = 0; source[i] != '\0' && writePos < sizeof(token) - 1; i++) {
+    const unsigned char ch = static_cast<unsigned char>(source[i]);
+    if (isspace(ch) || ch == '"' || ch == '\'' || ch == '-' || ch == '_') {
+      continue;
+    }
+    token[writePos++] = static_cast<char>(tolower(ch));
+  }
+  token[writePos] = '\0';
+
+  if (writePos == 0) {
+    strcpy(token, "auto");
+    writePos = strlen(token);
+  }
+
+  if (normalized != nullptr && normalizedSize > 0) {
+    const size_t copyLen = (writePos < normalizedSize - 1) ? writePos : (normalizedSize - 1);
+    memcpy(normalized, token, copyLen);
+    normalized[copyLen] = '\0';
+  }
+
+  if (strcmp(token, "auto") == 0) {
+    if (valueValid != nullptr) *valueValid = true;
+    if (forceEnabled != nullptr) *forceEnabled = false;
+    return CameraSensorProfile::UNKNOWN;
+  }
+  if (strcmp(token, "ov2640") == 0) {
+    if (valueValid != nullptr) *valueValid = true;
+    if (forceEnabled != nullptr) *forceEnabled = true;
+    return CameraSensorProfile::OV2640;
+  }
+  if (strcmp(token, "ov3660") == 0) {
+    if (valueValid != nullptr) *valueValid = true;
+    if (forceEnabled != nullptr) *forceEnabled = true;
+    return CameraSensorProfile::OV3660;
+  }
+  if (strcmp(token, "gc2145") == 0) {
+    if (valueValid != nullptr) *valueValid = true;
+    if (forceEnabled != nullptr) *forceEnabled = true;
+    return CameraSensorProfile::GC2145;
+  }
+
+  return CameraSensorProfile::UNKNOWN;
+}
+
+const char* pixformatToString(pixformat_t pixformat) {
+  if (pixformat == PIXFORMAT_JPEG) return "JPEG";
+  return "NON_JPEG";
+}
+
+const char* frameSizeToString(framesize_t frameSize) {
+  if (frameSize == FRAMESIZE_QVGA) return "QVGA";
+  if (frameSize == FRAMESIZE_VGA) return "VGA";
+  return "OTHER";
+}
+
+template <typename T>
+bool applySensorSetting(sensor_t* sensor, const char* settingName, T value, int (*setter)(sensor_t*, T)) {
+  if (sensor == nullptr || setter == nullptr) {
+    Serial.printf("[CAM] 参数设置失败: %s=%d, setter 不可用\n", settingName, static_cast<int>(value));
+    return false;
+  }
+
+  const int rc = setter(sensor, value);
+  if (rc != 0) {
+    Serial.printf("[CAM] 参数设置失败: %s=%d, rc=%d\n", settingName, static_cast<int>(value), rc);
+    return false;
+  }
+  return true;
+}
+
 bool initCamera() {
+  const char* forceRaw = CAM_STRINGIFY(CAM_FORCE_SENSOR);
+  char forceNormalized[16] = {0};
+  bool forceEnabled = false;
+  bool forceValid = false;
+  const CameraSensorProfile forcedProfile = parseForcedSensorProfile(
+    forceRaw,
+    &forceEnabled,
+    &forceValid,
+    forceNormalized,
+    sizeof(forceNormalized)
+  );
+  if (!forceValid) {
+    Serial.printf(
+      "[CAM] CAM_FORCE_SENSOR 配置无效: raw=%s, 仅支持 auto/ov2640/ov3660/gc2145，已回退 auto\n",
+      forceRaw
+    );
+  }
+  Serial.printf(
+    "[CAM] CAM_FORCE_SENSOR raw=%s parsed=%s enabled=%s\n",
+    forceRaw,
+    forceNormalized,
+    forceEnabled ? "yes" : "no"
+  );
+  Serial.printf(
+    "[CAM] 依赖检查: gc2145 header hint=%s\n",
+    HAS_GC2145_DRIVER_HEADER_HINT ? "found" : "not-found"
+  );
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -1038,12 +1202,22 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  if (psramFound()) {
-    config.frame_size = streamFrameSizePsram;
+  const bool hasPsram = psramFound();
+  framesize_t targetFrameSize = hasPsram ? streamFrameSizePsram : streamFrameSizeNoPsram;
+  if (forceEnabled &&
+      forcedProfile == CameraSensorProfile::GC2145 &&
+      targetFrameSize != FRAMESIZE_QVGA &&
+      targetFrameSize != FRAMESIZE_VGA) {
+    targetFrameSize = hasPsram ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
+    Serial.printf("[CAM] GC2145 模式已调整分辨率到 %s\n", frameSizeToString(targetFrameSize));
+  }
+
+  if (hasPsram) {
+    config.frame_size = targetFrameSize;
     config.jpeg_quality = streamJpegQualityPsram;
     config.fb_count = 3;
   } else {
-    config.frame_size = streamFrameSizeNoPsram;
+    config.frame_size = targetFrameSize;
     config.jpeg_quality = streamJpegQualityNoPsram;
     config.fb_count = 1;
   }
@@ -1063,56 +1237,102 @@ bool initCamera() {
 
   currentJpegQuality = static_cast<uint8_t>(config.jpeg_quality);
   sensor_t* sensor = esp_camera_sensor_get();
-  if (sensor) {
-    const uint16_t sensorPid = sensor->id.PID;
-    const bool isOv2640 = (sensorPid == OV2640_PID);
-    const bool isOv3660 = (sensorPid == OV3660_PID);
-    const bool isGc2145 = (sensorPid == GC2145_PID);
+  uint16_t detectedPid = 0;
+  CameraSensorProfile detectedProfile = CameraSensorProfile::UNKNOWN;
+  if (sensor != nullptr) {
+    detectedPid = sensor->id.PID;
+    detectedProfile = cameraSensorProfileFromPid(detectedPid);
+  }
+  CameraSensorProfile activeProfile = forceEnabled ? forcedProfile : detectedProfile;
 
-    if (isOv2640) {
-      Serial.printf("[CAM] 检测到传感器: OV2640 (PID=0x%04X)\n", sensorPid);
-    } else if (isOv3660) {
-      Serial.printf("[CAM] 检测到传感器: OV3660 (PID=0x%04X)\n", sensorPid);
-    } else if (isGc2145) {
-      Serial.printf("[CAM] 检测到传感器: GC2145 (PID=0x%04X)\n", sensorPid);
-    } else {
-      Serial.printf("[CAM] 检测到传感器: Unknown (PID=0x%04X)\n", sensorPid);
+  Serial.printf(
+    "[CAM] 探测 PID=0x%04X, detected=%s\n",
+    detectedPid,
+    cameraSensorProfileToString(detectedProfile)
+  );
+  if (forceEnabled) {
+    Serial.printf(
+      "[CAM] 强制传感器已启用: %s\n",
+      cameraSensorProfileToString(forcedProfile)
+    );
+    if (forcedProfile != detectedProfile) {
+      Serial.printf(
+        "[CAM] 强制覆盖探测结果: %s -> %s\n",
+        cameraSensorProfileToString(detectedProfile),
+        cameraSensorProfileToString(forcedProfile)
+      );
     }
+  }
+  Serial.printf("[CAM] 传感器决策 final=%s\n", cameraSensorProfileToString(activeProfile));
 
-    sensor->set_quality(sensor, currentJpegQuality);
-    sensor->set_contrast(sensor, 2);
-    sensor->set_sharpness(sensor, 2);
-    sensor->set_denoise(sensor, 0);
-    sensor->set_gainceiling(sensor, GAINCEILING_8X);
-    sensor->set_aec2(sensor, 1);
-    sensor->set_dcw(sensor, 0);
-    sensor->set_lenc(sensor, 1);
-    sensor->set_brightness(sensor, 0);
-    sensor->set_saturation(sensor, 0);
+  bool settingOk = true;
+  if (sensor != nullptr) {
+    settingOk &= applySensorSetting(
+      sensor,
+      "set_pixformat",
+      config.pixel_format,
+      sensor->set_pixformat
+    );
+    settingOk &= applySensorSetting(
+      sensor,
+      "set_framesize",
+      config.frame_size,
+      sensor->set_framesize
+    );
+    settingOk &= applySensorSetting(
+      sensor,
+      "set_quality",
+      static_cast<int>(currentJpegQuality),
+      sensor->set_quality
+    );
 
-    if (isOv3660) {
-      // OV3660 常见稳定参数：图像方向和轻微色彩校准
-      sensor->set_vflip(sensor, 1);
-      sensor->set_hmirror(sensor, 0);
-      sensor->set_brightness(sensor, 1);
-      sensor->set_saturation(sensor, -1);
-      Serial.println("[CAM] 已应用 OV3660 保守调优: vflip=1 hmirror=0 brightness=1 saturation=-1");
-    } else if (isGc2145) {
-      // GC2145 在 AI Thinker DVP 模组上的保守参数，优先稳定性
-      sensor->set_vflip(sensor, 0);
-      sensor->set_hmirror(sensor, 0);
-      sensor->set_gainceiling(sensor, GAINCEILING_4X);
-      sensor->set_dcw(sensor, 1);
-      Serial.println("[CAM] 已应用 GC2145 保守调优: vflip=0 hmirror=0 gainceiling=4x dcw=1");
+    settingOk &= applySensorSetting(sensor, "set_contrast", 2, sensor->set_contrast);
+    settingOk &= applySensorSetting(sensor, "set_sharpness", 2, sensor->set_sharpness);
+    settingOk &= applySensorSetting(sensor, "set_denoise", 0, sensor->set_denoise);
+    settingOk &= applySensorSetting(sensor, "set_gainceiling", GAINCEILING_8X, sensor->set_gainceiling);
+    settingOk &= applySensorSetting(sensor, "set_aec2", 1, sensor->set_aec2);
+    settingOk &= applySensorSetting(sensor, "set_dcw", 0, sensor->set_dcw);
+    settingOk &= applySensorSetting(sensor, "set_lenc", 1, sensor->set_lenc);
+    settingOk &= applySensorSetting(sensor, "set_brightness", 0, sensor->set_brightness);
+    settingOk &= applySensorSetting(sensor, "set_saturation", 0, sensor->set_saturation);
+
+    if (activeProfile == CameraSensorProfile::OV3660) {
+      settingOk &= applySensorSetting(sensor, "set_vflip", 1, sensor->set_vflip);
+      settingOk &= applySensorSetting(sensor, "set_hmirror", 0, sensor->set_hmirror);
+      settingOk &= applySensorSetting(sensor, "set_brightness", 1, sensor->set_brightness);
+      settingOk &= applySensorSetting(sensor, "set_saturation", -1, sensor->set_saturation);
+      Serial.println("[CAM] 已应用 OV3660 保守调优");
+    } else if (activeProfile == CameraSensorProfile::GC2145) {
+      settingOk &= applySensorSetting(sensor, "set_vflip", 0, sensor->set_vflip);
+      settingOk &= applySensorSetting(sensor, "set_hmirror", 0, sensor->set_hmirror);
+      settingOk &= applySensorSetting(sensor, "set_gainceiling", GAINCEILING_4X, sensor->set_gainceiling);
+      settingOk &= applySensorSetting(sensor, "set_dcw", 1, sensor->set_dcw);
+      settingOk &= applySensorSetting(sensor, "set_contrast", 1, sensor->set_contrast);
+      settingOk &= applySensorSetting(sensor, "set_sharpness", 1, sensor->set_sharpness);
+      settingOk &= applySensorSetting(sensor, "set_denoise", 1, sensor->set_denoise);
+      settingOk &= applySensorSetting(sensor, "set_brightness", 0, sensor->set_brightness);
+      settingOk &= applySensorSetting(sensor, "set_saturation", 0, sensor->set_saturation);
+      Serial.println(
+        "[CAM] 已应用 GC2145 稳定参数: JPEG + QVGA/VGA + gainceiling=4x + dcw=1"
+      );
     }
+  } else {
+    settingOk = false;
+    Serial.println("[CAM] 警告: 未获取到 sensor 句柄，无法应用参数");
   }
 
   Serial.printf(
-    "[CAM] 初始化成功 frame=%d quality=%d fb_count=%d\n",
+    "[CAM] 最终配置 pixformat=%s(%d), framesize=%s(%d), jpeg_quality=%d, fb_count=%d\n",
+    pixformatToString(config.pixel_format),
+    static_cast<int>(config.pixel_format),
+    frameSizeToString(config.frame_size),
     static_cast<int>(config.frame_size),
     config.jpeg_quality,
     config.fb_count
   );
+  if (!settingOk) {
+    Serial.println("[CAM] 警告: 部分参数设置失败，已继续运行");
+  }
   return true;
 }
 
