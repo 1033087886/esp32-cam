@@ -146,7 +146,13 @@
   </div>
 
   <script>
-    const wsUrl = "wss://esp.rose980.eu.cc:443/viewer";
+    const wsUrl = (() => {
+      const wsOverride = new URLSearchParams(window.location.search).get("ws");
+      if (wsOverride && wsOverride.trim().length > 0) {
+        return wsOverride.trim();
+      }
+      return "wss://stream.rose980.eu.cc/viewer?room=cam01";
+    })();
 
     const statusValue = document.getElementById("statusValue");
     const fpsValue = document.getElementById("fpsValue");

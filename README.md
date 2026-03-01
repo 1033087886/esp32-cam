@@ -96,3 +96,45 @@ pio run -e esp32cam --project-option="build_flags=-D CAM_FORCE_SENSOR=gc2145"
   - `"[CAM] CAM_FORCE_SENSOR raw=... parsed=... enabled=..."`
   - `"[CAM] 最终配置 pixformat=JPEG(...), framesize=QVGA/VGA(...), jpeg_quality=..."`
 - 若出现 `参数设置失败` 日志，说明某项 sensor setter 未生效；固件会继续运行并保留告警。
+
+## Cloudflare Worker 无 NAS 中转方案
+
+该方案使用 `Cloudflare Workers + Durable Objects` 代替 NAS 中转：
+
+- ESP32 作为 publisher 连接 `WS /esp32`
+- 浏览器 viewer 连接 `WS /viewer`
+- Durable Object 按 `room` 分房，把 publisher 的 JPEG 二进制帧广播给同房间全部 viewer
+- `GET /healthz` 可用于健康检查
+
+### 架构说明
+
+1. ESP32 发送帧到 Worker 的 `/esp32?room=...&token=...`
+2. Worker 进行 token 鉴权后，将连接路由到对应 room 的 Durable Object
+3. Viewer 连接 `/viewer?room=...`（可选 token）
+4. Durable Object 接收 publisher 二进制帧并广播给所有 viewer
+
+### 优势
+
+- 不依赖家庭/NAS 公网入口
+- 原生 HTTPS/WSS 与边缘接入，部署简单
+- 多 viewer 分发由 Durable Object 承担，ESP 只维护一条上行
+
+### 限制
+
+- 仍受 ESP 上行带宽与帧率/分辨率约束
+- Worker/DO 有平台配额与计费限制
+- 全球跨区观看会引入网络抖动，建议结合前端重连与码率控制
+
+### 快速部署入口
+
+- 直接按文档执行：`cf-worker/README.md`
+- 目录：`cf-worker/`
+
+### ESP 与前端改动点
+
+- ESP 端默认推流地址已改为：
+  - `wss://stream.rose980.eu.cc/esp32?room=cam01`
+  - 如需鉴权，在查询参数追加 `&token=...`（不要硬编码 token）
+- 前端 `index.html` 已支持：
+  - 优先读取 URL 参数 `ws`（例如 `?ws=wss%3A%2F%2Fstream.example.com%2Fviewer%3Froom%3Dcam01`）
+  - 未传 `ws` 时默认使用 `wss://stream.rose980.eu.cc/viewer?room=cam01`

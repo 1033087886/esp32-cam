@@ -1,0 +1,11 @@
+name = "esp32-cam-relay"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+
+[[durable_objects.bindings]]
+name = "ROOM_RELAY"
+class_name = "RoomRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomRelay"]

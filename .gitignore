@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Cloudflare worker local cache
+cf-worker/.wrangler/
+cf-worker/node_modules/

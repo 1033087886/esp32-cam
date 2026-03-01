@@ -306,11 +306,12 @@ const uint8_t ipv6MaxRetry = 15;
 const framesize_t streamFrameSizePsram = FRAMESIZE_VGA;
 const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
 
-// Stream URL copied from the HTML reference file
-const char* streamWsUrl = "wss://esp.rose980.eu.cc:443/esp32";
-const char* streamWsHost = "esp.rose980.eu.cc";
+// Stream URL for Cloudflare Worker relay (no NAS).
+// Token should be appended via query parameter (e.g. &token=xxx), do not hardcode secrets in firmware.
+const char* streamWsUrl = "wss://stream.rose980.eu.cc/esp32?room=cam01";
+const char* streamWsHost = "stream.rose980.eu.cc";
 const uint16_t streamWsPort = 443;
-const char* streamWsPath = "/esp32";
+const char* streamWsPath = "/esp32?room=cam01";
 const char* streamWsCaCert = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIG1TCCBL2gAwIBAgIQbFWr29AHksedBwzYEZ7WvzANBgkqhkiG9w0BAQwFADCB
@@ -458,7 +459,7 @@ void setup() {
       Serial.printf("[WS] 推流连接断开，在线时长=%lu ms, RSSI=%d\n", aliveMs, WiFi.RSSI());
     }
   });
-  wsClient.addHeader("Origin", "https://esp.rose980.eu.cc");
+  wsClient.addHeader("Origin", "https://stream.rose980.eu.cc");
   wsClient.addHeader("User-Agent", "ESP32-CAM");
 
   connectWiFi();
