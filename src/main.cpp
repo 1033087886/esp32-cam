@@ -1060,6 +1060,18 @@ bool initCamera() {
   currentJpegQuality = static_cast<uint8_t>(config.jpeg_quality);
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor) {
+    const uint16_t sensorPid = sensor->id.PID;
+    const bool isOv2640 = (sensorPid == OV2640_PID);
+    const bool isOv3660 = (sensorPid == OV3660_PID);
+
+    if (isOv2640) {
+      Serial.printf("[CAM] 检测到传感器: OV2640 (PID=0x%04X)\n", sensorPid);
+    } else if (isOv3660) {
+      Serial.printf("[CAM] 检测到传感器: OV3660 (PID=0x%04X)\n", sensorPid);
+    } else {
+      Serial.printf("[CAM] 检测到传感器: Unknown (PID=0x%04X)\n", sensorPid);
+    }
+
     sensor->set_quality(sensor, currentJpegQuality);
     sensor->set_contrast(sensor, 2);
     sensor->set_sharpness(sensor, 2);
@@ -1070,6 +1082,15 @@ bool initCamera() {
     sensor->set_lenc(sensor, 1);
     sensor->set_brightness(sensor, 0);
     sensor->set_saturation(sensor, 0);
+
+    if (isOv3660) {
+      // OV3660 常见稳定参数：图像方向和轻微色彩校准
+      sensor->set_vflip(sensor, 1);
+      sensor->set_hmirror(sensor, 0);
+      sensor->set_brightness(sensor, 1);
+      sensor->set_saturation(sensor, -1);
+      Serial.println("[CAM] 已应用 OV3660 保守调优: vflip=1 hmirror=0 brightness=1 saturation=-1");
+    }
   }
 
   Serial.printf(

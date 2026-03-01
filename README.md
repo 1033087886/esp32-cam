@@ -43,3 +43,11 @@ esp32cam/<deviceId>/
 - 请在 `src/main.cpp` 中按实际环境修改 WiFi、MQTT、推流地址参数。
 - 当前代码已支持 IPv6 申请与类型判定；若仅出现 `LINK_LOCAL`，表示不可直接公网路由。
 - 手机热点场景通常不需要 Portal 认证，本项目默认已关闭 `enablePortalAuth`。
+
+## OV3660 兼容说明
+
+- `src/main.cpp` 的 `initCamera()` 已根据传感器 PID 自动识别 `OV2640 / OV3660 / 其他` 并打印日志。
+- 检测到 OV3660 时，会应用一组保守参数（`vflip/hmirror/brightness/saturation`）以提高 ESP32-CAM 推流稳定性。
+- 若画面方向不符合你的安装方式，可在 `initCamera()` 的 OV3660 分支中调整：
+  - `sensor->set_vflip(sensor, ...)`
+  - `sensor->set_hmirror(sensor, ...)`
