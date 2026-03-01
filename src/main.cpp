@@ -25,6 +25,10 @@
 #include <esp_arduino_version.h>
 #endif
 
+#ifndef GC2145_PID
+#define GC2145_PID 0x2145
+#endif
+
 using namespace websockets;
 
 class EspTlsSecuredTcpClient : public websockets::network::TcpClient {
@@ -1063,11 +1067,14 @@ bool initCamera() {
     const uint16_t sensorPid = sensor->id.PID;
     const bool isOv2640 = (sensorPid == OV2640_PID);
     const bool isOv3660 = (sensorPid == OV3660_PID);
+    const bool isGc2145 = (sensorPid == GC2145_PID);
 
     if (isOv2640) {
       Serial.printf("[CAM] 检测到传感器: OV2640 (PID=0x%04X)\n", sensorPid);
     } else if (isOv3660) {
       Serial.printf("[CAM] 检测到传感器: OV3660 (PID=0x%04X)\n", sensorPid);
+    } else if (isGc2145) {
+      Serial.printf("[CAM] 检测到传感器: GC2145 (PID=0x%04X)\n", sensorPid);
     } else {
       Serial.printf("[CAM] 检测到传感器: Unknown (PID=0x%04X)\n", sensorPid);
     }
@@ -1090,6 +1097,13 @@ bool initCamera() {
       sensor->set_brightness(sensor, 1);
       sensor->set_saturation(sensor, -1);
       Serial.println("[CAM] 已应用 OV3660 保守调优: vflip=1 hmirror=0 brightness=1 saturation=-1");
+    } else if (isGc2145) {
+      // GC2145 在 AI Thinker DVP 模组上的保守参数，优先稳定性
+      sensor->set_vflip(sensor, 0);
+      sensor->set_hmirror(sensor, 0);
+      sensor->set_gainceiling(sensor, GAINCEILING_4X);
+      sensor->set_dcw(sensor, 1);
+      Serial.println("[CAM] 已应用 GC2145 保守调优: vflip=0 hmirror=0 gainceiling=4x dcw=1");
     }
   }
 

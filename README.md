@@ -46,8 +46,14 @@ esp32cam/<deviceId>/
 
 ## OV3660 兼容说明
 
-- `src/main.cpp` 的 `initCamera()` 已根据传感器 PID 自动识别 `OV2640 / OV3660 / 其他` 并打印日志。
+- `src/main.cpp` 的 `initCamera()` 已根据传感器 PID 自动识别 `OV2640 / OV3660 / GC2145 / 其他` 并打印日志。
 - 检测到 OV3660 时，会应用一组保守参数（`vflip/hmirror/brightness/saturation`）以提高 ESP32-CAM 推流稳定性。
 - 若画面方向不符合你的安装方式，可在 `initCamera()` 的 OV3660 分支中调整：
   - `sensor->set_vflip(sensor, ...)`
   - `sensor->set_hmirror(sensor, ...)`
+
+## GC2145 兼容说明
+
+- `initCamera()` 已新增 `GC2145` 识别与日志，PID 为 `0x2145`。
+- 检测到 GC2145 时，仅在 GC2145 分支应用一组保守参数（`vflip/hmirror/gainceiling/dcw`），不会影响 OV2640/OV3660。
+- 若底层 `esp32-camera` 版本不包含 GC2145 驱动，`esp_camera_init()` 可能失败；需升级到包含 GC2145 的 `esp32-camera` 版本（本项目已在 `platformio.ini` 显式指定）。
