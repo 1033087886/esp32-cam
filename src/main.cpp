@@ -17,6 +17,9 @@
 #if __has_include("esp_crt_bundle.h")
 #include "esp_crt_bundle.h"
 #define HAS_ESP_CRT_BUNDLE 1
+#elif __has_include(<esp_crt_bundle.h>)
+#include <esp_crt_bundle.h>
+#define HAS_ESP_CRT_BUNDLE 1
 #else
 #define HAS_ESP_CRT_BUNDLE 0
 #endif
@@ -39,13 +42,42 @@
 #define CAM_FORCE_SENSOR auto
 #endif
 
+#ifndef STREAM_WS_HOST
+#define STREAM_WS_HOST "stream.rose980.eu.cc"
+#endif
+
+#ifndef STREAM_WS_ROOM
+#define STREAM_WS_ROOM "cam01"
+#endif
+
+#ifndef STREAM_WS_TOKEN
+#define STREAM_WS_TOKEN ""
+#endif
+
 #define CAM_STRINGIFY_IMPL(value) #value
 #define CAM_STRINGIFY(value) CAM_STRINGIFY_IMPL(value)
+#define STREAM_WS_PATH_LITERAL "/esp32?room=" STREAM_WS_ROOM "&token=" STREAM_WS_TOKEN
+#define STREAM_WS_URL_LITERAL "wss://" STREAM_WS_HOST STREAM_WS_PATH_LITERAL
 
 #if __has_include("sensors/private_include/gc2145_settings.h")
 #define HAS_GC2145_DRIVER_HEADER_HINT 1
 #else
 #define HAS_GC2145_DRIVER_HEADER_HINT 0
+#endif
+
+#if HAS_ESP_CRT_BUNDLE
+extern "C" esp_err_t arduino_esp_crt_bundle_attach(void* conf) __attribute__((weak));
+extern "C" esp_err_t esp_crt_bundle_attach(void* conf) __attribute__((weak));
+
+static esp_err_t (*resolveCrtBundleAttach())(void*) {
+  if (arduino_esp_crt_bundle_attach != nullptr) {
+    return arduino_esp_crt_bundle_attach;
+  }
+  if (esp_crt_bundle_attach != nullptr) {
+    return esp_crt_bundle_attach;
+  }
+  return nullptr;
+}
 #endif
 
 using namespace websockets;
@@ -69,14 +101,19 @@ public:
     cfg.keep_alive_cfg = &_keepAlive;
     cfg.common_name = _host.c_str();
 
-#if HAS_ESP_CRT_BUNDLE
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-#endif
-
     if (_caCert != nullptr && strlen(_caCert) > 0) {
       cfg.cacert_buf = reinterpret_cast<const unsigned char*>(_caCert);
       cfg.cacert_bytes = strlen(_caCert) + 1;
     }
+
+#if HAS_ESP_CRT_BUNDLE
+    if (cfg.cacert_buf == nullptr && cfg.cacert_bytes == 0) {
+      esp_err_t (*crtBundleAttach)(void*) = resolveCrtBundleAttach();
+      if (crtBundleAttach != nullptr) {
+        cfg.crt_bundle_attach = crtBundleAttach;
+      }
+    }
+#endif
 
     _tls = esp_tls_init();
     if (_tls == nullptr) {
@@ -85,6 +122,19 @@ public:
 
     int ret = esp_tls_conn_new_sync(_host.c_str(), _host.length(), port, &cfg, _tls);
     if (ret != 1) {
+      int tlsCode = 0;
+      int tlsFlags = 0;
+      if (_tls != nullptr && _tls->error_handle != nullptr) {
+        esp_tls_get_and_clear_last_error(_tls->error_handle, &tlsCode, &tlsFlags);
+      }
+      Serial.printf(
+        "[WS][TLS] connect failed ret=%d tlsCode=0x%X tlsFlags=0x%X host=%s port=%d\n",
+        ret,
+        tlsCode,
+        tlsFlags,
+        _host.c_str(),
+        port
+      );
       esp_tls_conn_destroy(_tls);
       _tls = nullptr;
       _connected = false;
@@ -317,50 +367,43 @@ const framesize_t streamFrameSizePsram = FRAMESIZE_VGA;
 const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
 
 // Stream URL for Cloudflare Worker relay (no NAS).
-// Token should be appended via query parameter (e.g. &token=xxx), do not hardcode secrets in firmware.
-const char* streamWsUrl = "wss://stream.rose980.eu.cc/esp32?room=cam01&token=1033087886";
-const char* streamWsHost = "stream.rose980.eu.cc";
+// WS host/room/token are injected via build flags (see platformio.ini).
+const char* streamWsUrl = STREAM_WS_URL_LITERAL;
+const char* streamWsHost = STREAM_WS_HOST;
 const uint16_t streamWsPort = 443;
-const char* streamWsPath = "/esp32?room=cam01&token=1033087886";
+const char* streamWsPath = STREAM_WS_PATH_LITERAL;
+// WSS trust anchors for stream.rose980.eu.cc:
+// - WE1 (intermediate)
+// - GlobalSign ECC Root CA - R4 (root)
+// Keeping both improves compatibility when edge chain formatting varies.
 const char* streamWsCaCert = R"EOF(
 -----BEGIN CERTIFICATE-----
-MIIG1TCCBL2gAwIBAgIQbFWr29AHksedBwzYEZ7WvzANBgkqhkiG9w0BAQwFADCB
-iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl
-cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV
-BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMjAw
-MTMwMDAwMDAwWhcNMzAwMTI5MjM1OTU5WjBLMQswCQYDVQQGEwJBVDEQMA4GA1UE
-ChMHWmVyb1NTTDEqMCgGA1UEAxMhWmVyb1NTTCBSU0EgRG9tYWluIFNlY3VyZSBT
-aXRlIENBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAhmlzfqO1Mdgj
-4W3dpBPTVBX1AuvcAyG1fl0dUnw/MeueCWzRWTheZ35LVo91kLI3DDVaZKW+TBAs
-JBjEbYmMwcWSTWYCg5334SF0+ctDAsFxsX+rTDh9kSrG/4mp6OShubLaEIUJiZo4
-t873TuSd0Wj5DWt3DtpAG8T35l/v+xrN8ub8PSSoX5Vkgw+jWf4KQtNvUFLDq8mF
-WhUnPL6jHAADXpvs4lTNYwOtx9yQtbpxwSt7QJY1+ICrmRJB6BuKRt/jfDJF9Jsc
-RQVlHIxQdKAJl7oaVnXgDkqtk2qddd3kCDXd74gv813G91z7CjsGyJ93oJIlNS3U
-gFbD6V54JMgZ3rSmotYbz98oZxX7MKbtCm1aJ/q+hTv2YK1yMxrnfcieKmOYBbFD
-hnW5O6RMA703dBK92j6XRN2EttLkQuujZgy+jXRKtaWMIlkNkWJmOiHmErQngHvt
-iNkIcjJumq1ddFX4iaTI40a6zgvIBtxFeDs2RfcaH73er7ctNUUqgQT5rFgJhMmF
-x76rQgB5OZUkodb5k2ex7P+Gu4J86bS15094UuYcV09hVeknmTh5Ex9CBKipLS2W
-2wKBakf+aVYnNCU6S0nASqt2xrZpGC1v7v6DhuepyyJtn3qSV2PoBiU5Sql+aARp
-wUibQMGm44gjyNDqDlVp+ShLQlUH9x8CAwEAAaOCAXUwggFxMB8GA1UdIwQYMBaA
-FFN5v1qqK0rPVIDh2JvAnfKyA2bLMB0GA1UdDgQWBBTI2XhootkZaNU9ct5fCj7c
-tYaGpjAOBgNVHQ8BAf8EBAMCAYYwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHSUE
-FjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwIgYDVR0gBBswGTANBgsrBgEEAbIxAQIC
-TjAIBgZngQwBAgEwUAYDVR0fBEkwRzBFoEOgQYY/aHR0cDovL2NybC51c2VydHJ1
-c3QuY29tL1VTRVJUcnVzdFJTQUNlcnRpZmljYXRpb25BdXRob3JpdHkuY3JsMHYG
-CCsGAQUFBwEBBGowaDA/BggrBgEFBQcwAoYzaHR0cDovL2NydC51c2VydHJ1c3Qu
-Y29tL1VTRVJUcnVzdFJTQUFkZFRydXN0Q0EuY3J0MCUGCCsGAQUFBzABhhlodHRw
-Oi8vb2NzcC51c2VydHJ1c3QuY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAVDwoIzQDV
-ercT0eYqZjBNJ8VNWwVFlQOtZERqn5iWnEVaLZZdzxlbvz2Fx0ExUNuUEgYkIVM4
-YocKkCQ7hO5noicoq/DrEYH5IuNcuW1I8JJZ9DLuB1fYvIHlZ2JG46iNbVKA3ygA
-Ez86RvDQlt2C494qqPVItRjrz9YlJEGT0DrttyApq0YLFDzf+Z1pkMhh7c+7fXeJ
-qmIhfJpduKc8HEQkYQQShen426S3H0JrIAbKcBCiyYFuOhfyvuwVCFDfFvrjADjd
-4jX1uQXd161IyFRbm89s2Oj5oU1wDYz5sx+hoCuh6lSs+/uPuWomIq3y1GDFNafW
-+LsHBU16lQo5Q2yh25laQsKRgyPmMpHJ98edm6y2sHUabASmRHxvGiuwwE25aDU0
-2SAeepyImJ2CzB80YG7WxlynHqNhpE7xfC7PzQlLgmfEHdU+tHFeQazRQnrFkW2W
-kqRGIq7cKRnyypvjPMkjeiV9lRdAM9fSJvsB3svUuu1coIG1xxI1yegoGM4r5QP4
-RGIVvYaiI76C0djoSbQ/dkIUUXQuB8AL5jyH34g3BZaaXyvpmnV4ilppMXVAnAYG
-ON51WhJ6W0xNdNJwzYASZYH+tmCWI+N60Gv2NNMGHwMZ7e9bXgzUCZH5FaBFDGR5
-S9VWqHB73Q+OyIVvIbKYcSc2w/aSuFKGSA==
+MIICjjCCAjOgAwIBAgIQf/NXaJvCTjAtkOGKQb0OHzAKBggqhkjOPQQDAjBQMSQw
+IgYDVQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0gUjQxEzARBgNVBAoTCkds
+b2JhbFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMjMxMjEzMDkwMDAwWhcN
+MjkwMjIwMTQwMDAwWjA7MQswCQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRy
+dXN0IFNlcnZpY2VzMQwwCgYDVQQDEwNXRTEwWTATBgcqhkjOPQIBBggqhkjOPQMB
+BwNCAARvzTr+Z1dHTCEDhUDCR127WEcPQMFcF4XGGTfn1XzthkubgdnXGhOlCgP4
+mMTG6J7/EFmPLCaY9eYmJbsPAvpWo4IBAjCB/zAOBgNVHQ8BAf8EBAMCAYYwHQYD
+VR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMBIGA1UdEwEB/wQIMAYBAf8CAQAw
+HQYDVR0OBBYEFJB3kjVnxP+ozKnme9mAeXvMk/k4MB8GA1UdIwQYMBaAFFSwe61F
+uOJAf/sKbvu+M8k8o4TVMDYGCCsGAQUFBwEBBCowKDAmBggrBgEFBQcwAoYaaHR0
+cDovL2kucGtpLmdvb2cvZ3NyNC5jcnQwLQYDVR0fBCYwJDAioCCgHoYcaHR0cDov
+L2MucGtpLmdvb2cvci9nc3I0LmNybDATBgNVHSAEDDAKMAgGBmeBDAECATAKBggq
+hkjOPQQDAgNJADBGAiEAokJL0LgR6SOLR02WWxccAq3ndXp4EMRveXMUVUxMWSMC
+IQDspFWa3fj7nLgouSdkcPy1SdOR2AGm9OQWs7veyXsBwA==
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIB3DCCAYOgAwIBAgINAgPlfvU/k/2lCSGypjAKBggqhkjOPQQDAjBQMSQwIgYD
+VQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0gUjQxEzARBgNVBAoTCkdsb2Jh
+bFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMTIxMTEzMDAwMDAwWhcNMzgw
+MTE5MDMxNDA3WjBQMSQwIgYDVQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0g
+UjQxEzARBgNVBAoTCkdsb2JhbFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wWTAT
+BgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4xnnTj2wlDp8uORkcA6SumuU5BwkWymOx
+uYb4ilfBV85C+nOh92VC/x7BALJucw7/xyHlGKSq2XE/qNS5zowdo0IwQDAOBgNV
+HQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUVLB7rUW44kB/
++wpu+74zyTyjhNUwCgYIKoZIzj0EAwIDRwAwRAIgIk90crlgr/HmnKAWBVBfw147
+bmF0774BxL4YSFlhgjICICadVGNA3jdgUM/I2O2dgq43mLyjj0xMqTQrbO/7lZsm
 -----END CERTIFICATE-----
 )EOF";
 
@@ -432,6 +475,9 @@ void setup() {
   delay(150);
   Serial.println("\n--- ESP32-CAM MQTT + WS 推流启动 ---");
   printMemoryInfo("启动后");
+  if (strlen(STREAM_WS_TOKEN) == 0) {
+    Serial.println("[WS] 警告: STREAM_WS_TOKEN 为空，若 Worker 开启鉴权将返回 401");
+  }
   WiFi.onEvent(onWiFiEvent);
 
   setupTopics();
