@@ -308,10 +308,10 @@ const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
 
 // Stream URL for Cloudflare Worker relay (no NAS).
 // Token should be appended via query parameter (e.g. &token=xxx), do not hardcode secrets in firmware.
-const char* streamWsUrl = "wss://stream.rose980.eu.cc/esp32?room=cam01";
+const char* streamWsUrl = "wss://stream.rose980.eu.cc/esp32?room=cam01&token=1033087886";
 const char* streamWsHost = "stream.rose980.eu.cc";
 const uint16_t streamWsPort = 443;
-const char* streamWsPath = "/esp32?room=cam01";
+const char* streamWsPath = "/esp32?room=cam01&token=1033087886";
 const char* streamWsCaCert = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIG1TCCBL2gAwIBAgIQbFWr29AHksedBwzYEZ7WvzANBgkqhkiG9w0BAQwFADCB
