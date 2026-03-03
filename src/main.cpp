@@ -14,6 +14,12 @@
 #include "lwip/ip6_addr.h"
 #include "lwip/sockets.h"
 #include "esp_tls.h"
+#if __has_include("esp_crt_bundle.h")
+#include "esp_crt_bundle.h"
+#define HAS_ESP_CRT_BUNDLE 1
+#else
+#define HAS_ESP_CRT_BUNDLE 0
+#endif
 #if __has_include(<esp32/spiram.h>)
 #include <esp32/spiram.h>
 #define HAS_SPIRAM_CHIP_API 1
@@ -62,6 +68,10 @@ public:
     cfg.timeout_ms = 10000;
     cfg.keep_alive_cfg = &_keepAlive;
     cfg.common_name = _host.c_str();
+
+#if HAS_ESP_CRT_BUNDLE
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
 
     if (_caCert != nullptr && strlen(_caCert) > 0) {
       cfg.cacert_buf = reinterpret_cast<const unsigned char*>(_caCert);
