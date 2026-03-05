@@ -1,5 +1,9 @@
 # ESP32-CAM MQTT + WebSocket 推流
 
+[![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange)](https://platformio.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![WS Relay](https://img.shields.io/badge/Relay-Cloudflare%20Workers%20%2B%20DO-2ea44f)](https://stream.rose980.eu.cc)
+
 这个项目基于 PlatformIO，使用 ESP32-CAM 实现：
 
 - MQTT 远程控制补光灯亮度（0-255）
