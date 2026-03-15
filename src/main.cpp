@@ -1,5 +1,7 @@
 ﻿#include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -263,7 +265,32 @@ enum class CameraSensorProfile : uint8_t {
   GC2145
 };
 
+enum class WiFiControlState : uint8_t {
+  BOOT = 0,
+  CONNECTING,
+  CONNECTED,
+  PROVISIONING
+};
+
 void connectWiFi();
+void maintainWiFiConnection();
+void beginProvisioningCandidate(const String& ssid, const String& password);
+bool loadStoredWiFiCredentials();
+void saveStoredWiFiCredentials(const String& ssid, const String& password);
+void clearStoredWiFiCredentials();
+void startProvisioningAp(const char* reason);
+void stopProvisioningAp();
+void setupProvisioningServer();
+void handleProvisioningRoot();
+void handleProvisioningScan();
+void handleProvisioningConnect();
+void handleProvisioningStatus();
+void handleProvisioningReset();
+void handleProvisioningNotFound();
+String buildProvisioningStatusJson();
+String escapeJson(const String& value);
+const char* wifiControlStateToString(WiFiControlState state);
+const char* wifiAuthModeToString(wifi_auth_mode_t authMode);
 void doPortalAuth();
 void testInternet();
 void setupMqttTransport();
@@ -303,11 +330,172 @@ const char* frameSizeToString(framesize_t frameSize);
 template <typename T>
 bool applySensorSetting(sensor_t* sensor, const char* settingName, T value, int (*setter)(sensor_t*, T));
 
-// WiFi settings
-// const char* ssid = "Keropok";
-// const char* password = "ssz1151220817";
-const char* ssid = "Xiaomi 13 Ultra";
-const char* password = "1033087886";
+#ifndef DEFAULT_WIFI_SSID
+#define DEFAULT_WIFI_SSID ""
+#endif
+
+#ifndef DEFAULT_WIFI_PASSWORD
+#define DEFAULT_WIFI_PASSWORD ""
+#endif
+
+const char* wifiPrefsNamespace = "wifi_cfg";
+const uint32_t wifiPrefsVersion = 1;
+const unsigned long wifiConnectTimeoutInitial = 20000UL;
+const unsigned long wifiConnectTimeoutRecovery = 60000UL;
+const char* provisioningApPrefix = "ESP32CAM-";
+const IPAddress provisioningApIp(192, 168, 4, 1);
+
+const char provisioningPageHtml[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32-CAM 配网</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 20px; }
+    .card { background: #111827; border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+    h1, h2 { margin-top: 0; }
+    label { display: block; margin: 12px 0 6px; font-weight: 600; }
+    input, button { width: 100%; box-sizing: border-box; border-radius: 10px; border: 1px solid #334155; padding: 12px; font-size: 16px; }
+    input { background: #0b1220; color: #e2e8f0; }
+    button { background: #2563eb; color: white; border: 0; cursor: pointer; margin-top: 10px; }
+    button.secondary { background: #334155; }
+    button.warn { background: #b91c1c; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { padding: 12px; border-radius: 10px; background: #0b1220; margin-bottom: 8px; cursor: pointer; }
+    .muted { color: #94a3b8; }
+    .status { white-space: pre-wrap; line-height: 1.6; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>ESP32-CAM 配网</h1>
+      <div id="status" class="status muted">正在读取状态...</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button type="button" onclick="scanNetworks()">扫描附近 Wi‑Fi</button>
+        <button type="button" class="secondary" onclick="refreshStatus()">刷新状态</button>
+      </div>
+      <div id="scanHint" class="muted" style="margin-top:10px">点击上方按钮获取网络列表，也可以手动输入隐藏 SSID。</div>
+      <ul id="networks" style="margin-top:12px"></ul>
+    </div>
+
+    <div class="card">
+      <h2>连接新的 Wi‑Fi</h2>
+      <form id="wifiForm">
+        <label for="ssid">Wi‑Fi 名称 (SSID)</label>
+        <input id="ssid" name="ssid" autocomplete="off" placeholder="输入或点击上方列表自动填充">
+        <label for="password">Wi‑Fi 密码</label>
+        <input id="password" name="password" type="password" placeholder="至少 8 位，开放网络可留空">
+        <button type="submit">保存并连接</button>
+      </form>
+      <button type="button" class="warn" onclick="resetConfig()">清除已保存配置并重新配网</button>
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const scanHintEl = document.getElementById('scanHint');
+    const networksEl = document.getElementById('networks');
+    const ssidEl = document.getElementById('ssid');
+    const passwordEl = document.getElementById('password');
+
+    function pickNetwork(name) {
+      ssidEl.value = name;
+      passwordEl.focus();
+    }
+
+    function renderStatus(data) {
+      const lines = [
+        `设备: ${data.device_id || '-'}`,
+        `状态: ${data.state || '-'}`,
+        `当前 Wi‑Fi: ${data.connected_ssid || '-'}`,
+        `已保存 Wi‑Fi: ${data.saved_ssid || '-'}`,
+        `STA IP: ${data.sta_ip || '-'}`,
+        `AP 热点: ${data.ap_ssid || '-'} (${data.ap_ip || '-'})`,
+        `提示: ${data.message || '-'}`
+      ];
+      statusEl.textContent = lines.join('\n');
+    }
+
+    async function refreshStatus() {
+      try {
+        const resp = await fetch('/status');
+        const data = await resp.json();
+        renderStatus(data);
+      } catch (err) {
+        statusEl.textContent = '读取状态失败: ' + err;
+      }
+    }
+
+    async function scanNetworks() {
+      networksEl.innerHTML = '';
+      scanHintEl.textContent = '扫描中，请稍候...';
+      try {
+        const resp = await fetch('/scan');
+        const data = await resp.json();
+        const items = data.networks || [];
+        if (!items.length) {
+          scanHintEl.textContent = data.message || '没有扫描到 Wi‑Fi，请手动输入。';
+          return;
+        }
+        scanHintEl.textContent = '点击列表项可自动填入 SSID。';
+        items.forEach((item) => {
+          const li = document.createElement('li');
+          li.textContent = `${item.ssid}  ·  ${item.rssi} dBm  ·  ${item.auth}`;
+          li.onclick = () => pickNetwork(item.ssid);
+          networksEl.appendChild(li);
+        });
+      } catch (err) {
+        scanHintEl.textContent = '扫描失败: ' + err;
+      }
+    }
+
+    async function submitForm(event) {
+      event.preventDefault();
+      const ssid = ssidEl.value.trim();
+      if (!ssid) {
+        alert('SSID 不能为空');
+        return;
+      }
+      const payload = new URLSearchParams({ ssid, password: passwordEl.value });
+      const resp = await fetch('/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: payload.toString()
+      });
+      const data = await resp.json();
+      alert(data.message || '已提交，请等待设备连接');
+      refreshStatus();
+    }
+
+    async function resetConfig() {
+      if (!confirm('确定要清除已保存的 Wi‑Fi 配置吗？')) {
+        return;
+      }
+      const resp = await fetch('/reset', { method: 'POST' });
+      const data = await resp.json();
+      alert(data.message || '已清除配置');
+      refreshStatus();
+    }
+
+    document.getElementById('wifiForm').addEventListener('submit', submitForm);
+    refreshStatus();
+    scanNetworks();
+    setInterval(refreshStatus, 2500);
+  </script>
+</body>
+</html>
+)HTML";
+
 // Optional captive portal auth (from ESP32-mqtt project workflow)
 const bool enablePortalAuth = false;
 const char* portalAuthBaseUrl = "http://192.168.100.2:8080/wportal/Onekey";
@@ -438,6 +626,8 @@ WiFiClient mqttPlainClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttClient(mqttPlainClient);
 WebsocketsClient wsClient(std::make_shared<EspTlsSecuredTcpClient>(streamWsCaCert));
+Preferences wifiPrefs;
+WebServer provisioningServer(80);
 bool wsConnected = false;
 bool mqttUsingInsecure = false;
 
@@ -463,6 +653,22 @@ unsigned long streamBytesSent = 0;
 unsigned long wsBusyDropCount = 0;
 uint8_t currentJpegQuality = 0;
 bool wifiWasConnected = false;
+bool wifiHasEverConnected = false;
+bool provisioningApActive = false;
+bool provisioningServerStarted = false;
+bool pendingProvisionRequest = false;
+bool pendingResetRequest = false;
+bool pendingCredentialSave = false;
+WiFiControlState wifiControlState = WiFiControlState::BOOT;
+String savedWiFiSsid;
+String savedWiFiPassword;
+String connectTargetSsid;
+String connectTargetPassword;
+String pendingProvisionSsid;
+String pendingProvisionPassword;
+String provisioningApSsid;
+String provisioningMessage = "初始化中";
+unsigned long wifiConnectStartedAt = 0;
 bool hasIPv6 = false;
 String currentIPv6;
 String currentIPv6Type = "NONE";
@@ -478,10 +684,15 @@ void setup() {
   if (strlen(STREAM_WS_TOKEN) == 0) {
     Serial.println("[WS] 警告: STREAM_WS_TOKEN 为空，若 Worker 开启鉴权将返回 401");
   }
+
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWiFiEvent);
 
   setupTopics();
   setupFlashPwm();
+  setupProvisioningServer();
 
   if (!initCamera()) {
     Serial.println("[BOOT] 摄像头初始化失败，5秒后重启");
@@ -518,36 +729,27 @@ void setup() {
   wsClient.addHeader("Origin", "https://stream.rose980.eu.cc");
   wsClient.addHeader("User-Agent", "ESP32-CAM");
 
-  connectWiFi();
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiWasConnected = true;
-    if (enablePortalAuth) {
-      doPortalAuth();
-      previousAuthTime = millis();
-      delay(1000);
-      testInternet();
-    }
-    syncTimeIfNeeded();
+  if (loadStoredWiFiCredentials()) {
+    connectTargetSsid = savedWiFiSsid;
+    connectTargetPassword = savedWiFiPassword;
+    connectWiFi();
+  } else {
+    startProvisioningAp("首次启动未发现已保存的 Wi‑Fi");
   }
-
-  connectMQTT();
-  connectStreamWs();
 }
 
 void loop() {
   unsigned long now = millis();
 
+  provisioningServer.handleClient();
+  maintainWiFiConnection();
+
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiWasConnected) {
       wifiWasConnected = false;
-      Serial.println("[WiFi] 已断开，等待重连");
+      Serial.println("[WiFi] 已断开，等待恢复或重新配网");
       wsConnected = false;
       if (wsClient.available()) wsClient.close();
-    }
-
-    if (now - lastWifiRetryTime >= wifiReconnectInterval) {
-      lastWifiRetryTime = now;
-      connectWiFi();
     }
 
     delay(10);
@@ -556,7 +758,20 @@ void loop() {
 
   if (!wifiWasConnected) {
     wifiWasConnected = true;
-    Serial.printf("[WiFi] 重连成功，IP=%s\n", WiFi.localIP().toString().c_str());
+    wifiHasEverConnected = true;
+    wifiControlState = WiFiControlState::CONNECTED;
+    Serial.printf("[WiFi] 连接成功，SSID=%s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+    if (pendingCredentialSave) {
+      saveStoredWiFiCredentials(connectTargetSsid, connectTargetPassword);
+      pendingCredentialSave = false;
+      provisioningMessage = String("已连接并保存 Wi‑Fi: ") + connectTargetSsid;
+    } else {
+      provisioningMessage = String("已连接 Wi‑Fi: ") + WiFi.SSID();
+    }
+
+    stopProvisioningAp();
+
     if (enablePortalAuth) {
       doPortalAuth();
       previousAuthTime = now;
@@ -571,16 +786,16 @@ void loop() {
     doPortalAuth();
   }
 
-  if (!mqttClient.connected() && now - lastMqttConnectAttempt >= mqttReconnectInterval) {
-    lastMqttConnectAttempt = now;
-    connectMQTT();
-  }
-
   if (!hasIPv6 && ipv6TryCount < ipv6MaxRetry && now - lastIPv6TryTime >= ipv6RetryInterval) {
     requestIPv6("loop-retry");
   } else if (!hasIPv6 && ipv6TryCount >= ipv6MaxRetry && !ipv6RetryExhaustedLogged) {
     ipv6RetryExhaustedLogged = true;
     Serial.println("[WiFi] IPv6 多次申请仍未成功，当前热点可能未向 STA 分配 IPv6");
+  }
+
+  if (!mqttClient.connected() && now - lastMqttConnectAttempt >= mqttReconnectInterval) {
+    lastMqttConnectAttempt = now;
+    connectMQTT();
   }
 
   if (mqttClient.connected()) {
@@ -607,108 +822,8 @@ void loop() {
     }
     lastWsPingTime = now;
   }
-}
 
-void setupTopics() {
-  String base = String("esp32cam/") + deviceId;
-  topicCmdLight = base + "/cmd/light";
-  topicStateLight = base + "/state/light";
-  topicStateOnline = base + "/state/online";
-  topicStateHeartbeat = base + "/state/heartbeat";
-  topicAck = base + "/ack";
-}
-
-void setupFlashPwm() {
-  pinMode(flashLedPin, OUTPUT);
-
-  if (useNewLedcApi) {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    if (!ledcAttach(flashLedPin, 5000, 8)) {
-      Serial.println("[LED] ledcAttach 初始化失败");
-    }
-#endif
-  } else {
-#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
-    ledcSetup(flashLedChannel, 5000, 8);
-    ledcAttachPin(flashLedPin, flashLedChannel);
-#endif
-  }
-
-  setFlashBrightness(0, false);
-}
-
-void setFlashBrightness(uint8_t value, bool reportState) {
-  currentLight = value;
-
-  if (useNewLedcApi) {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(flashLedPin, currentLight);
-#endif
-  } else {
-#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
-    ledcWrite(flashLedChannel, currentLight);
-#endif
-  }
-
-  Serial.printf("[LED] 当前亮度=%u\n", currentLight);
-
-  if (reportState) {
-    publishLightState();
-  }
-}
-
-void publishLightState() {
-  if (!mqttClient.connected()) return;
-
-  String payload = String("{\"light\":") + String(currentLight) + ",\"pin\":" + String(flashLedPin) + "}";
-  if (mqttClient.publish(topicStateLight.c_str(), payload.c_str(), true)) {
-    Serial.println("[MQTT] 亮度状态: " + payload);
-  }
-}
-
-void publishHeartbeat() {
-  if (!mqttClient.connected()) return;
-
-  String payload = "{";
-  payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  if (hasIPv6 && currentIPv6.length() > 0) {
-    payload += "\"ipv6\":\"" + currentIPv6 + "\",";
-    payload += "\"ipv6_type\":\"" + currentIPv6Type + "\",";
-  }
-  payload += "\"mac\":\"" + WiFi.macAddress() + "\",";
-  payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  payload += "\"light\":" + String(currentLight);
-  payload += "}";
-
-  if (mqttClient.publish(topicStateHeartbeat.c_str(), payload.c_str(), false)) {
-    Serial.println("[MQTT] 心跳: " + payload);
-  }
-}
-
-void publishAck(const char* msg) {
-  if (!mqttClient.connected()) return;
-  mqttClient.publish(topicAck.c_str(), msg, false);
-}
-
-void setupMqttTransport() {
-  if (!mqttUseTls) {
-    mqttClient.setClient(mqttPlainClient);
-    mqttUsingInsecure = true;
-    Serial.println("[MQTT] 使用明文 TCP 模式（1883）");
-    return;
-  }
-
-  mqttClient.setClient(mqttTlsClient);
-
-  if (strstr(mqttCaCert, "PASTE_YOUR_CA_CERT_HERE") != nullptr) {
-    mqttUsingInsecure = true;
-    mqttTlsClient.setInsecure();
-    Serial.println("[MQTT] TLS 未配置 CA，已启用 setInsecure");
-  } else {
-    mqttUsingInsecure = false;
-    mqttTlsClient.setCACert(mqttCaCert);
-    Serial.println("[MQTT] TLS 已加载 CA 证书");
-  }
+  delay(2);
 }
 
 void syncTimeIfNeeded() {
@@ -741,6 +856,8 @@ void onWiFiEvent(WiFiEvent_t event) {
     }
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
+      wifiControlState = WiFiControlState::CONNECTED;
+      wifiConnectStartedAt = 0;
       requestIPv6("STA_GOT_IP");
       break;
     }
@@ -758,6 +875,12 @@ void onWiFiEvent(WiFiEvent_t event) {
       lastIPv6TryTime = 0;
       ipv6TryCount = 0;
       ipv6RetryExhaustedLogged = false;
+      if (wifiControlState != WiFiControlState::PROVISIONING) {
+        wifiControlState = WiFiControlState::CONNECTING;
+        if (wifiConnectStartedAt == 0) {
+          wifiConnectStartedAt = millis();
+        }
+      }
       break;
 
     default:
@@ -845,24 +968,439 @@ void refreshIPv6Status(bool verbose) {
 }
 
 void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (connectTargetSsid.length() == 0) {
+    startProvisioningAp("未提供 Wi‑Fi 配置");
+    return;
+  }
 
-  Serial.printf("[WiFi] 正在连接 %s\n", ssid);
-  WiFi.mode(WIFI_STA);
+  WiFi.mode((provisioningApActive || pendingCredentialSave) ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(ssid, password);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(connectTargetSsid.c_str(), connectTargetPassword.c_str());
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  wifiControlState = WiFiControlState::CONNECTING;
+  wifiConnectStartedAt = millis();
+  lastWifiRetryTime = wifiConnectStartedAt;
+  provisioningMessage = pendingCredentialSave
+    ? String("正在测试新 Wi‑Fi: ") + connectTargetSsid
+    : String("正在连接已保存 Wi‑Fi: ") + connectTargetSsid;
+
+  Serial.printf("[WiFi] 正在连接 %s%s\n", connectTargetSsid.c_str(), pendingCredentialSave ? " (新配置测试)" : "");
+}
+
+const char* wifiControlStateToString(WiFiControlState state) {
+  switch (state) {
+    case WiFiControlState::BOOT: return "BOOT";
+    case WiFiControlState::CONNECTING: return "CONNECTING";
+    case WiFiControlState::CONNECTED: return "CONNECTED";
+    case WiFiControlState::PROVISIONING: return "PROVISIONING";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* wifiAuthModeToString(wifi_auth_mode_t authMode) {
+  switch (authMode) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    default: return "UNKNOWN";
+  }
+}
+
+String escapeJson(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char ch = value[i];
+    switch (ch) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += ch; break;
+    }
+  }
+  return out;
+}
+
+bool loadStoredWiFiCredentials() {
+  savedWiFiSsid = "";
+  savedWiFiPassword = "";
+
+  if (wifiPrefs.begin(wifiPrefsNamespace, false)) {
+    bool valid = wifiPrefs.getBool("valid", false);
+    uint32_t version = wifiPrefs.getUInt("version", 0);
+    if (valid && version == wifiPrefsVersion) {
+      savedWiFiSsid = wifiPrefs.getString("ssid", "");
+      savedWiFiPassword = wifiPrefs.getString("password", "");
+    }
+    wifiPrefs.end();
+  }
+
+  if (savedWiFiSsid.length() == 0) {
+    String defaultSsid = DEFAULT_WIFI_SSID;
+    String defaultPassword = DEFAULT_WIFI_PASSWORD;
+    if (defaultSsid.length() > 0) {
+      savedWiFiSsid = defaultSsid;
+      savedWiFiPassword = defaultPassword;
+      Serial.printf("[WiFi] 使用编译默认网络: %s\n", savedWiFiSsid.c_str());
+    }
+  }
+
+  return savedWiFiSsid.length() > 0;
+}
+
+void saveStoredWiFiCredentials(const String& ssid, const String& password) {
+  if (!wifiPrefs.begin(wifiPrefsNamespace, false)) {
+    Serial.println("[WiFi] 保存配置失败: NVS 打开失败");
+    return;
+  }
+
+  wifiPrefs.putUInt("version", wifiPrefsVersion);
+  wifiPrefs.putBool("valid", true);
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("password", password);
+  wifiPrefs.end();
+
+  savedWiFiSsid = ssid;
+  savedWiFiPassword = password;
+  Serial.printf("[WiFi] 已保存配置: %s\n", ssid.c_str());
+}
+
+void clearStoredWiFiCredentials() {
+  if (!wifiPrefs.begin(wifiPrefsNamespace, false)) {
+    Serial.println("[WiFi] 清除配置失败: NVS 打开失败");
+    return;
+  }
+  wifiPrefs.clear();
+  wifiPrefs.end();
+
+  savedWiFiSsid = "";
+  savedWiFiPassword = "";
+  connectTargetSsid = "";
+  connectTargetPassword = "";
+  Serial.println("[WiFi] 已清除已保存的 Wi‑Fi 配置");
+}
+
+String buildProvisioningStatusJson() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  String json = "{";
+  json += "\"device_id\":\"" + escapeJson(deviceId) + "\",";
+  json += "\"state\":\"" + String(wifiControlStateToString(wifiControlState)) + "\",";
+  json += "\"connected\":";
+  json += connected ? "true" : "false";
+  json += ",";
+  json += "\"connected_ssid\":\"" + escapeJson(connected ? WiFi.SSID() : String()) + "\",";
+  json += "\"saved_ssid\":\"" + escapeJson(savedWiFiSsid) + "\",";
+  json += "\"sta_ip\":\"" + escapeJson(connected ? WiFi.localIP().toString() : String()) + "\",";
+  json += "\"ap_ssid\":\"" + escapeJson(provisioningApActive ? provisioningApSsid : String()) + "\",";
+  json += "\"ap_ip\":\"" + escapeJson(provisioningApActive ? WiFi.softAPIP().toString() : String()) + "\",";
+  json += "\"message\":\"" + escapeJson(provisioningMessage) + "\"";
+  json += "}";
+  return json;
+}
+
+void handleProvisioningRoot() {
+  provisioningServer.send_P(200, "text/html; charset=utf-8", provisioningPageHtml);
+}
+
+void handleProvisioningStatus() {
+  provisioningServer.send(200, "application/json; charset=utf-8", buildProvisioningStatusJson());
+}
+
+void handleProvisioningScan() {
+  WiFi.scanDelete();
+  int count = WiFi.scanNetworks();
+
+  String json = "{\"ok\":true,\"networks\":[";
+  bool first = true;
+
+  if (count > 0) {
+    for (int i = 0; i < count; i++) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) {
+        continue;
+      }
+      if (!first) {
+        json += ",";
+      }
+      first = false;
+      json += "{\"ssid\":\"" + escapeJson(ssid) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"auth\":\"" + String(wifiAuthModeToString(static_cast<wifi_auth_mode_t>(WiFi.encryptionType(i)))) + "\"}";
+    }
+  }
+
+  json += "]";
+  if (count <= 0) {
+    json += ",\"message\":\"没有扫描到 Wi‑Fi，请手动输入隐藏 SSID\"";
+  }
+  json += "}";
+
+  WiFi.scanDelete();
+  provisioningServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleProvisioningConnect() {
+  String ssid = provisioningServer.arg("ssid");
+  String password = provisioningServer.arg("password");
+  ssid.trim();
+
+  if (ssid.length() == 0) {
+    provisioningServer.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"message\":\"SSID 不能为空\"}");
+    return;
+  }
+
+  pendingProvisionSsid = ssid;
+  pendingProvisionPassword = password;
+  pendingProvisionRequest = true;
+  provisioningMessage = String("已收到新配置，准备连接: ") + ssid;
+
+  provisioningServer.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"已开始连接新 Wi‑Fi，请等待 10~20 秒\"}");
+}
+
+void handleProvisioningReset() {
+  pendingResetRequest = true;
+  provisioningMessage = "准备清除已保存配置";
+  provisioningServer.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"已开始清除配置，设备将重新进入配网模式\"}");
+}
+
+void handleProvisioningNotFound() {
+  provisioningServer.sendHeader("Location", "/");
+  provisioningServer.send(302, "text/plain", "redirect");
+}
+
+void setupProvisioningServer() {
+  provisioningServer.on("/", HTTP_GET, handleProvisioningRoot);
+  provisioningServer.on("/scan", HTTP_GET, handleProvisioningScan);
+  provisioningServer.on("/connect", HTTP_POST, handleProvisioningConnect);
+  provisioningServer.on("/status", HTTP_GET, handleProvisioningStatus);
+  provisioningServer.on("/reset", HTTP_POST, handleProvisioningReset);
+  provisioningServer.onNotFound(handleProvisioningNotFound);
+}
+
+void startProvisioningAp(const char* reason) {
+  if (provisioningApSsid.length() == 0) {
+    uint64_t chipId = ESP.getEfuseMac();
+    char suffix[5] = {};
+    snprintf(suffix, sizeof(suffix), "%04X", static_cast<unsigned int>(chipId & 0xFFFFULL));
+    provisioningApSsid = String(provisioningApPrefix) + suffix;
+  }
+
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  if (wsClient.available()) {
+    wsClient.close();
+  }
+  wsConnected = false;
+  wifiWasConnected = false;
+  wifiControlState = WiFiControlState::PROVISIONING;
+  wifiConnectStartedAt = 0;
+
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAPConfig(provisioningApIp, provisioningApIp, IPAddress(255, 255, 255, 0));
+
+  if (!provisioningApActive) {
+    provisioningApActive = WiFi.softAP(provisioningApSsid.c_str());
+  }
+
+  if (provisioningApActive && !provisioningServerStarted) {
+    provisioningServer.begin();
+    provisioningServerStarted = true;
+    Serial.println("[WEB] 配网页服务已启动");
+  }
+
+  provisioningMessage = String(reason) + "。请连接热点 " + provisioningApSsid + "，然后打开 192.168.4.1";
+  Serial.printf("[WiFi] 进入配网模式，AP=%s, IP=%s\n", provisioningApSsid.c_str(), WiFi.softAPIP().toString().c_str());
+}
+
+void stopProvisioningAp() {
+  if (!provisioningApActive) {
+    return;
+  }
+
+  WiFi.softAPdisconnect(true);
+  provisioningApActive = false;
+  WiFi.mode(WIFI_STA);
+  Serial.println("[WiFi] 已关闭配网热点");
+}
+
+void beginProvisioningCandidate(const String& ssid, const String& password) {
+  if (!provisioningApActive) {
+    startProvisioningAp("准备切换到新的 Wi‑Fi");
+  }
+
+  connectTargetSsid = ssid;
+  connectTargetPassword = password;
+  pendingCredentialSave = true;
+  connectWiFi();
+}
+
+void maintainWiFiConnection() {
+  unsigned long now = millis();
+
+  if (pendingResetRequest) {
+    pendingResetRequest = false;
+    pendingProvisionRequest = false;
+    pendingCredentialSave = false;
+    clearStoredWiFiCredentials();
+    startProvisioningAp("已清除已保存的 Wi‑Fi 配置");
+    return;
+  }
+
+  if (pendingProvisionRequest) {
+    pendingProvisionRequest = false;
+    beginProvisioningCandidate(pendingProvisionSsid, pendingProvisionPassword);
+    return;
+  }
+
+  if (wifiControlState != WiFiControlState::CONNECTING) {
+    return;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] 连接成功，IP=%s\n", WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  if (now - lastWifiRetryTime >= wifiReconnectInterval) {
+    lastWifiRetryTime = now;
+    WiFi.reconnect();
+  }
+
+  unsigned long timeout = (pendingCredentialSave || !wifiHasEverConnected)
+    ? wifiConnectTimeoutInitial
+    : wifiConnectTimeoutRecovery;
+
+  if (wifiConnectStartedAt == 0 || now - wifiConnectStartedAt < timeout) {
+    return;
+  }
+
+  WiFi.disconnect();
+
+  if (pendingCredentialSave) {
+    pendingCredentialSave = false;
+    connectTargetSsid = "";
+    connectTargetPassword = "";
+    startProvisioningAp("新 Wi‑Fi 连接失败");
+    provisioningMessage = "新 Wi‑Fi 连接失败，请检查密码、频段或信号强度";
+    return;
+  }
+
+  if (savedWiFiSsid.length() > 0) {
+    startProvisioningAp("已保存的 Wi‑Fi 连接超时");
+    provisioningMessage = "旧 Wi‑Fi 长时间不可用，请重新配网";
   } else {
-    Serial.println("\n[WiFi] 连接失败，请检查 SSID/密码");
+    startProvisioningAp("未找到已保存 Wi‑Fi");
+  }
+}
+
+void setupTopics() {
+  String base = String("esp32cam/") + deviceId;
+  topicCmdLight = base + "/cmd/light";
+  topicStateLight = base + "/state/light";
+  topicStateOnline = base + "/state/online";
+  topicStateHeartbeat = base + "/state/heartbeat";
+  topicAck = base + "/ack";
+}
+
+void setupFlashPwm() {
+  pinMode(flashLedPin, OUTPUT);
+
+  if (useNewLedcApi) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    if (!ledcAttach(flashLedPin, 5000, 8)) {
+      Serial.println("[LED] ledcAttach 初始化失败");
+    }
+#endif
+  } else {
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
+    ledcSetup(flashLedChannel, 5000, 8);
+    ledcAttachPin(flashLedPin, flashLedChannel);
+#endif
+  }
+
+  setFlashBrightness(0, false);
+}
+
+void setFlashBrightness(uint8_t value, bool reportState) {
+  currentLight = value;
+
+  if (useNewLedcApi) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcWrite(flashLedPin, currentLight);
+#endif
+  } else {
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
+    ledcWrite(flashLedChannel, currentLight);
+#endif
+  }
+
+  Serial.printf("[LED] 当前亮度=%u\n", currentLight);
+
+  if (reportState) {
+    publishLightState();
+  }
+}
+
+void publishLightState() {
+  if (!mqttClient.connected()) return;
+
+  String payload = String("{\"light\":") + String(currentLight) + ",\"pin\":" + String(flashLedPin) + "}";
+  if (mqttClient.publish(topicStateLight.c_str(), payload.c_str(), true)) {
+    Serial.println("[MQTT] 亮度状态: " + payload);
+  }
+}
+
+void publishHeartbeat() {
+  if (!mqttClient.connected()) return;
+
+  String payload = "{";
+  payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  if (hasIPv6 && currentIPv6.length() > 0) {
+    payload += "\"ipv6\":\"" + currentIPv6 + "\",";
+    payload += "\"ipv6_type\":\"" + currentIPv6Type + "\",";
+  }
+  payload += "\"mac\":\"" + WiFi.macAddress() + "\",";
+  payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  payload += "\"light\":" + String(currentLight);
+  payload += "}";
+
+  if (mqttClient.publish(topicStateHeartbeat.c_str(), payload.c_str(), false)) {
+    Serial.println("[MQTT] 心跳: " + payload);
+  }
+}
+
+void publishAck(const char* msg) {
+  if (!mqttClient.connected()) return;
+  mqttClient.publish(topicAck.c_str(), msg, false);
+}
+void setupMqttTransport() {
+  if (!mqttUseTls) {
+    mqttClient.setClient(mqttPlainClient);
+    mqttUsingInsecure = true;
+    Serial.println("[MQTT] 使用明文 TCP 模式（1883）");
+    return;
+  }
+
+  mqttClient.setClient(mqttTlsClient);
+
+  if (strstr(mqttCaCert, "PASTE_YOUR_CA_CERT_HERE") != nullptr) {
+    mqttUsingInsecure = true;
+    mqttTlsClient.setInsecure();
+    Serial.println("[MQTT] TLS 未配置 CA，已启用 setInsecure");
+  } else {
+    mqttUsingInsecure = false;
+    mqttTlsClient.setCACert(mqttCaCert);
+    Serial.println("[MQTT] TLS 已加载 CA 证书");
   }
 }
 
