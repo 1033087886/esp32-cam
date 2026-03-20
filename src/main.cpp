@@ -6,25 +6,12 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoWebsockets.h>
-#include <tiny_websockets/network/tcp_client.hpp>
 #include "esp_camera.h"
 #include <time.h>
 #include <string.h>
 #include <ctype.h>
-#include <memory>
 #include "esp_netif.h"
 #include "lwip/ip6_addr.h"
-#include "lwip/sockets.h"
-#include "esp_tls.h"
-#if __has_include("esp_crt_bundle.h")
-#include "esp_crt_bundle.h"
-#define HAS_ESP_CRT_BUNDLE 1
-#elif __has_include(<esp_crt_bundle.h>)
-#include <esp_crt_bundle.h>
-#define HAS_ESP_CRT_BUNDLE 1
-#else
-#define HAS_ESP_CRT_BUNDLE 0
-#endif
 #if __has_include(<esp32/spiram.h>)
 #include <esp32/spiram.h>
 #define HAS_SPIRAM_CHIP_API 1
@@ -45,7 +32,11 @@
 #endif
 
 #ifndef STREAM_WS_HOST
-#define STREAM_WS_HOST "stream.rose980.eu.cc"
+#define STREAM_WS_HOST "8.166.129.84"
+#endif
+
+#ifndef STREAM_WS_PORT
+#define STREAM_WS_PORT 8888
 #endif
 
 #ifndef STREAM_WS_ROOM
@@ -58,8 +49,6 @@
 
 #define CAM_STRINGIFY_IMPL(value) #value
 #define CAM_STRINGIFY(value) CAM_STRINGIFY_IMPL(value)
-#define STREAM_WS_PATH_LITERAL "/esp32?room=" STREAM_WS_ROOM "&token=" STREAM_WS_TOKEN
-#define STREAM_WS_URL_LITERAL "wss://" STREAM_WS_HOST STREAM_WS_PATH_LITERAL
 
 #if __has_include("sensors/private_include/gc2145_settings.h")
 #define HAS_GC2145_DRIVER_HEADER_HINT 1
@@ -67,196 +56,7 @@
 #define HAS_GC2145_DRIVER_HEADER_HINT 0
 #endif
 
-#if HAS_ESP_CRT_BUNDLE
-extern "C" esp_err_t arduino_esp_crt_bundle_attach(void* conf) __attribute__((weak));
-extern "C" esp_err_t esp_crt_bundle_attach(void* conf) __attribute__((weak));
-
-static esp_err_t (*resolveCrtBundleAttach())(void*) {
-  if (arduino_esp_crt_bundle_attach != nullptr) {
-    return arduino_esp_crt_bundle_attach;
-  }
-  if (esp_crt_bundle_attach != nullptr) {
-    return esp_crt_bundle_attach;
-  }
-  return nullptr;
-}
-#endif
-
 using namespace websockets;
-
-class EspTlsSecuredTcpClient : public websockets::network::TcpClient {
-public:
-  explicit EspTlsSecuredTcpClient(const char* caCert)
-    : _tls(nullptr), _connected(false), _caCert(caCert) {
-    _keepAlive.keep_alive_enable = true;
-    _keepAlive.keep_alive_idle = 5;
-    _keepAlive.keep_alive_interval = 5;
-    _keepAlive.keep_alive_count = 3;
-  }
-
-  bool connect(const WSString& host, int port) override {
-    close();
-    _host = host;
-
-    esp_tls_cfg_t cfg = {};
-    cfg.timeout_ms = 10000;
-    cfg.keep_alive_cfg = &_keepAlive;
-    cfg.common_name = _host.c_str();
-
-    if (_caCert != nullptr && strlen(_caCert) > 0) {
-      cfg.cacert_buf = reinterpret_cast<const unsigned char*>(_caCert);
-      cfg.cacert_bytes = strlen(_caCert) + 1;
-    }
-
-#if HAS_ESP_CRT_BUNDLE
-    if (cfg.cacert_buf == nullptr && cfg.cacert_bytes == 0) {
-      esp_err_t (*crtBundleAttach)(void*) = resolveCrtBundleAttach();
-      if (crtBundleAttach != nullptr) {
-        cfg.crt_bundle_attach = crtBundleAttach;
-      }
-    }
-#endif
-
-    _tls = esp_tls_init();
-    if (_tls == nullptr) {
-      return false;
-    }
-
-    int ret = esp_tls_conn_new_sync(_host.c_str(), _host.length(), port, &cfg, _tls);
-    if (ret != 1) {
-      int tlsCode = 0;
-      int tlsFlags = 0;
-      if (_tls != nullptr && _tls->error_handle != nullptr) {
-        esp_tls_get_and_clear_last_error(_tls->error_handle, &tlsCode, &tlsFlags);
-      }
-      Serial.printf(
-        "[WS][TLS] connect failed ret=%d tlsCode=0x%X tlsFlags=0x%X host=%s port=%d\n",
-        ret,
-        tlsCode,
-        tlsFlags,
-        _host.c_str(),
-        port
-      );
-      esp_tls_conn_destroy(_tls);
-      _tls = nullptr;
-      _connected = false;
-      return false;
-    }
-
-    _connected = true;
-    return true;
-  }
-
-  bool poll() override {
-    if (!_connected || _tls == nullptr) return false;
-
-    int avail = esp_tls_get_bytes_avail(_tls);
-    if (avail > 0) return true;
-
-    int sockfd = -1;
-    if (esp_tls_get_conn_sockfd(_tls, &sockfd) != ESP_OK || sockfd < 0) return false;
-
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(sockfd, &readSet);
-    timeval tv = {};
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-
-    int rc = lwip_select(sockfd + 1, &readSet, nullptr, nullptr, &tv);
-    return rc > 0;
-  }
-
-  bool available() override {
-    return _connected && _tls != nullptr;
-  }
-
-  void send(const WSString& data) override {
-    send(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
-  }
-
-  void send(const WSString&& data) override {
-    send(reinterpret_cast<const uint8_t*>(data.c_str()), data.size());
-  }
-
-  void send(const uint8_t* data, const uint32_t len) override {
-    if (!_connected || _tls == nullptr || data == nullptr || len == 0) return;
-
-    uint32_t total = 0;
-    while (total < len) {
-      int written = esp_tls_conn_write(
-        _tls,
-        reinterpret_cast<const char*>(data + total),
-        static_cast<size_t>(len - total)
-      );
-      if (written <= 0) {
-        _connected = false;
-        return;
-      }
-      total += static_cast<uint32_t>(written);
-    }
-  }
-
-  WSString readLine() override {
-    WSString line;
-    if (!_connected || _tls == nullptr) return line;
-
-    const uint32_t timeoutMs = 8000;
-    unsigned long start = millis();
-    while (_connected && millis() - start < timeoutMs) {
-      char ch = 0;
-      int ret = esp_tls_conn_read(_tls, &ch, 1);
-      if (ret == 1) {
-        line += ch;
-        if (ch == '\n') {
-          break;
-        }
-      } else if (ret == 0) {
-        _connected = false;
-        break;
-      } else {
-        delay(1);
-      }
-    }
-    return line;
-  }
-
-  uint32_t read(uint8_t* buffer, const uint32_t len) override {
-    if (!_connected || _tls == nullptr || buffer == nullptr || len == 0) return 0;
-    int ret = esp_tls_conn_read(_tls, reinterpret_cast<char*>(buffer), len);
-    if (ret <= 0) {
-      if (ret == 0) {
-        _connected = false;
-      }
-      return 0;
-    }
-    return static_cast<uint32_t>(ret);
-  }
-
-  void close() override {
-    if (_tls != nullptr) {
-      esp_tls_conn_destroy(_tls);
-      _tls = nullptr;
-    }
-    _connected = false;
-  }
-
-  ~EspTlsSecuredTcpClient() override {
-    close();
-  }
-
-protected:
-  int getSocket() const override {
-    return -1;
-  }
-
-private:
-  esp_tls_t* _tls;
-  bool _connected;
-  const char* _caCert;
-  WSString _host;
-  tls_keep_alive_cfg_t _keepAlive;
-};
 
 enum class CameraSensorProfile : uint8_t {
   UNKNOWN = 0,
@@ -287,6 +87,7 @@ void handleProvisioningConnect();
 void handleProvisioningStatus();
 void handleProvisioningReset();
 void handleProvisioningNotFound();
+void handleLight();
 String buildProvisioningStatusJson();
 String escapeJson(const String& value);
 const char* wifiControlStateToString(WiFiControlState state);
@@ -554,46 +355,29 @@ const uint8_t ipv6MaxRetry = 15;
 const framesize_t streamFrameSizePsram = FRAMESIZE_VGA;
 const framesize_t streamFrameSizeNoPsram = FRAMESIZE_QVGA;
 
-// Stream URL for Cloudflare Worker relay (no NAS).
-// WS host/room/token are injected via build flags (see platformio.ini).
-const char* streamWsUrl = STREAM_WS_URL_LITERAL;
 const char* streamWsHost = STREAM_WS_HOST;
-const uint16_t streamWsPort = 443;
-const char* streamWsPath = STREAM_WS_PATH_LITERAL;
-// WSS trust anchors for stream.rose980.eu.cc:
-// - WE1 (intermediate)
-// - GlobalSign ECC Root CA - R4 (root)
-// Keeping both improves compatibility when edge chain formatting varies.
-const char* streamWsCaCert = R"EOF(
------BEGIN CERTIFICATE-----
-MIICjjCCAjOgAwIBAgIQf/NXaJvCTjAtkOGKQb0OHzAKBggqhkjOPQQDAjBQMSQw
-IgYDVQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0gUjQxEzARBgNVBAoTCkds
-b2JhbFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMjMxMjEzMDkwMDAwWhcN
-MjkwMjIwMTQwMDAwWjA7MQswCQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRy
-dXN0IFNlcnZpY2VzMQwwCgYDVQQDEwNXRTEwWTATBgcqhkjOPQIBBggqhkjOPQMB
-BwNCAARvzTr+Z1dHTCEDhUDCR127WEcPQMFcF4XGGTfn1XzthkubgdnXGhOlCgP4
-mMTG6J7/EFmPLCaY9eYmJbsPAvpWo4IBAjCB/zAOBgNVHQ8BAf8EBAMCAYYwHQYD
-VR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMBIGA1UdEwEB/wQIMAYBAf8CAQAw
-HQYDVR0OBBYEFJB3kjVnxP+ozKnme9mAeXvMk/k4MB8GA1UdIwQYMBaAFFSwe61F
-uOJAf/sKbvu+M8k8o4TVMDYGCCsGAQUFBwEBBCowKDAmBggrBgEFBQcwAoYaaHR0
-cDovL2kucGtpLmdvb2cvZ3NyNC5jcnQwLQYDVR0fBCYwJDAioCCgHoYcaHR0cDov
-L2MucGtpLmdvb2cvci9nc3I0LmNybDATBgNVHSAEDDAKMAgGBmeBDAECATAKBggq
-hkjOPQQDAgNJADBGAiEAokJL0LgR6SOLR02WWxccAq3ndXp4EMRveXMUVUxMWSMC
-IQDspFWa3fj7nLgouSdkcPy1SdOR2AGm9OQWs7veyXsBwA==
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIIB3DCCAYOgAwIBAgINAgPlfvU/k/2lCSGypjAKBggqhkjOPQQDAjBQMSQwIgYD
-VQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0gUjQxEzARBgNVBAoTCkdsb2Jh
-bFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMTIxMTEzMDAwMDAwWhcNMzgw
-MTE5MDMxNDA3WjBQMSQwIgYDVQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0g
-UjQxEzARBgNVBAoTCkdsb2JhbFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wWTAT
-BgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4xnnTj2wlDp8uORkcA6SumuU5BwkWymOx
-uYb4ilfBV85C+nOh92VC/x7BALJucw7/xyHlGKSq2XE/qNS5zowdo0IwQDAOBgNV
-HQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUVLB7rUW44kB/
-+wpu+74zyTyjhNUwCgYIKoZIzj0EAwIDRwAwRAIgIk90crlgr/HmnKAWBVBfw147
-bmF0774BxL4YSFlhgjICICadVGNA3jdgUM/I2O2dgq43mLyjj0xMqTQrbO/7lZsm
------END CERTIFICATE-----
-)EOF";
+const uint16_t streamWsPort = STREAM_WS_PORT;
+const char* streamWsRoom = STREAM_WS_ROOM;
+const char* streamWsToken = STREAM_WS_TOKEN;
+
+String buildStreamWsPath() {
+  String path = "/esp32?room=";
+  path += streamWsRoom;
+  if (strlen(streamWsToken) > 0) {
+    path += "&token=";
+    path += streamWsToken;
+  }
+  return path;
+}
+
+String buildStreamWsUrl(const String& path) {
+  String url = "ws://";
+  url += streamWsHost;
+  url += ":";
+  url += String(streamWsPort);
+  url += path;
+  return url;
+}
 
 // ESP32-CAM (AI Thinker) pins
 #define PWDN_GPIO_NUM 32
@@ -625,7 +409,7 @@ const uint8_t flashLedChannel = 7;
 WiFiClient mqttPlainClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttClient(mqttPlainClient);
-WebsocketsClient wsClient(std::make_shared<EspTlsSecuredTcpClient>(streamWsCaCert));
+WebsocketsClient wsClient;
 Preferences wifiPrefs;
 WebServer provisioningServer(80);
 bool wsConnected = false;
@@ -636,6 +420,8 @@ String topicStateLight;
 String topicStateOnline;
 String topicStateHeartbeat;
 String topicAck;
+String streamWsPath;
+String streamWsUrl;
 
 uint8_t currentLight = 0;
 unsigned long lastWifiRetryTime = 0;
@@ -652,6 +438,8 @@ unsigned long streamFramesDropped = 0;
 unsigned long streamBytesSent = 0;
 unsigned long wsBusyDropCount = 0;
 uint8_t currentJpegQuality = 0;
+int streamViewerCount = 0;
+bool streamPushEnabled = false;
 bool wifiWasConnected = false;
 bool wifiHasEverConnected = false;
 bool provisioningApActive = false;
@@ -681,9 +469,12 @@ void setup() {
   delay(150);
   Serial.println("\n--- ESP32-CAM MQTT + WS 推流启动 ---");
   printMemoryInfo("启动后");
-  if (strlen(STREAM_WS_TOKEN) == 0) {
-    Serial.println("[WS] 警告: STREAM_WS_TOKEN 为空，若 Worker 开启鉴权将返回 401");
+  streamWsPath = buildStreamWsPath();
+  streamWsUrl = buildStreamWsUrl(streamWsPath);
+  if (strlen(streamWsToken) == 0) {
+    Serial.println("[WS] STREAM_WS_TOKEN 为空，按无鉴权中转模式连接");
   }
+  Serial.println("[WS] 推流默认地址: " + streamWsUrl);
 
   WiFi.persistent(false);
   WiFi.setSleep(false);
@@ -712,6 +503,8 @@ void setup() {
     (void)data;
     if (event == WebsocketsEvent::ConnectionOpened) {
       wsConnected = true;
+      streamPushEnabled = false;
+      streamViewerCount = 0;
       wsConnectedAt = millis();
       lastWsPingTime = millis();
       lastStreamStatTime = millis();
@@ -719,14 +512,61 @@ void setup() {
       streamFramesDropped = 0;
       streamBytesSent = 0;
       wsBusyDropCount = 0;
-      Serial.println("[WS] 推流连接成功");
+      Serial.println("[WS] 推流连接成功，等待 viewer 启用视频");
     } else if (event == WebsocketsEvent::ConnectionClosed) {
       wsConnected = false;
+      streamPushEnabled = false;
+      streamViewerCount = 0;
       unsigned long aliveMs = (wsConnectedAt > 0) ? (millis() - wsConnectedAt) : 0;
       Serial.printf("[WS] 推流连接断开，在线时长=%lu ms, RSSI=%d\n", aliveMs, WiFi.RSSI());
     }
   });
-  wsClient.addHeader("Origin", "https://stream.rose980.eu.cc");
+
+  wsClient.onMessage([](WebsocketsMessage msg) {
+    if (!msg.isText()) return;
+    String text = msg.data();
+    String cmd = extractJsonValue(text, "cmd");
+    cmd.toLowerCase();
+    String valStr = extractJsonValue(text, "value");
+
+    if (cmd == "stream") {
+      String valLower = valStr;
+      valLower.toLowerCase();
+      const bool shouldPush = (valLower == "start" || valLower == "on" || valLower == "1");
+      const bool shouldPause = (valLower == "stop" || valLower == "off" || valLower == "0");
+      if (!shouldPush && !shouldPause) return;
+
+      String viewersStr = extractJsonValue(text, "viewers");
+      if (viewersStr.length() > 0) {
+        long viewers = viewersStr.toInt();
+        if (viewers < 0) viewers = 0;
+        streamViewerCount = static_cast<int>(viewers);
+      } else if (!shouldPush) {
+        streamViewerCount = 0;
+      }
+      streamPushEnabled = shouldPush;
+      lastFrameTime = 0;
+      lastStreamStatTime = millis();
+      streamFramesSent = 0;
+      streamFramesDropped = 0;
+      streamBytesSent = 0;
+      wsBusyDropCount = 0;
+      Serial.printf(
+        "[WS] 推流状态已更新: %s, viewers=%d\n",
+        streamPushEnabled ? "enabled" : "paused",
+        streamViewerCount
+      );
+      return;
+    }
+
+    if (cmd == "light") {
+      uint8_t nextValue;
+      if (parseBrightnessCommand(valStr, nextValue)) {
+        setFlashBrightness(nextValue, true);
+        Serial.printf("[WS] 收到补光灯指令 value=%s -> %u\n", valStr.c_str(), nextValue);
+      }
+    }
+  });
   wsClient.addHeader("User-Agent", "ESP32-CAM");
 
   if (loadStoredWiFiCredentials()) {
@@ -749,6 +589,8 @@ void loop() {
       wifiWasConnected = false;
       Serial.println("[WiFi] 已断开，等待恢复或重新配网");
       wsConnected = false;
+      streamPushEnabled = false;
+      streamViewerCount = 0;
       if (wsClient.available()) wsClient.close();
     }
 
@@ -1171,6 +1013,44 @@ void handleProvisioningReset() {
   provisioningServer.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"已开始清除配置，设备将重新进入配网模式\"}");
 }
 
+void handleLight() {
+  provisioningServer.sendHeader("Access-Control-Allow-Origin", "*");
+  provisioningServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  provisioningServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (provisioningServer.method() == HTTP_OPTIONS) {
+    provisioningServer.send(204);
+    return;
+  }
+
+  if (provisioningServer.method() == HTTP_GET) {
+    String json = "{\"ok\":true,\"light\":" + String(currentLight) + "}";
+    provisioningServer.send(200, "application/json; charset=utf-8", json);
+    return;
+  }
+
+  String valStr = provisioningServer.hasArg("value")
+    ? provisioningServer.arg("value")
+    : provisioningServer.arg("plain");
+  valStr.trim();
+
+  String valLower = valStr;
+  valLower.toLowerCase();
+
+  uint8_t nextValue;
+  if (valLower == "toggle" || valLower == "light/toggle") {
+    nextValue = (currentLight > 0) ? 0 : 255;
+  } else if (!parseBrightnessCommand(valStr, nextValue)) {
+    provisioningServer.send(400, "application/json; charset=utf-8",
+      "{\"ok\":false,\"message\":\"无效亮度值，接受 0-255 / on / off / toggle\"}");
+    return;
+  }
+
+  setFlashBrightness(nextValue, true);
+  String json = "{\"ok\":true,\"light\":" + String(currentLight) + "}";
+  provisioningServer.send(200, "application/json; charset=utf-8", json);
+}
+
 void handleProvisioningNotFound() {
   provisioningServer.sendHeader("Location", "/");
   provisioningServer.send(302, "text/plain", "redirect");
@@ -1182,6 +1062,9 @@ void setupProvisioningServer() {
   provisioningServer.on("/connect", HTTP_POST, handleProvisioningConnect);
   provisioningServer.on("/status", HTTP_GET, handleProvisioningStatus);
   provisioningServer.on("/reset", HTTP_POST, handleProvisioningReset);
+  provisioningServer.on("/light", HTTP_GET, handleLight);
+  provisioningServer.on("/light", HTTP_POST, handleLight);
+  provisioningServer.on("/light", HTTP_OPTIONS, handleLight);
   provisioningServer.onNotFound(handleProvisioningNotFound);
 }
 
@@ -1200,6 +1083,8 @@ void startProvisioningAp(const char* reason) {
     wsClient.close();
   }
   wsConnected = false;
+  streamPushEnabled = false;
+  streamViewerCount = 0;
   wifiWasConnected = false;
   wifiControlState = WiFiControlState::PROVISIONING;
   wifiConnectStartedAt = 0;
@@ -1935,11 +1820,11 @@ void connectStreamWs() {
   if (wsClient.available() || WiFi.status() != WL_CONNECTED) return;
 
   wsReconnectCount++;
-  Serial.println("[WS] 正在连接推流端点: " + String(streamWsUrl));
+  Serial.println("[WS] 正在连接推流端点: " + streamWsUrl);
   Serial.printf("[WS] 重连次数: %lu\n", wsReconnectCount);
   Serial.printf("[WS] 连接前可用堆内存: %u\n", ESP.getFreeHeap());
 
-  if (!wsClient.connect(streamWsHost, streamWsPort, streamWsPath)) {
+  if (!wsClient.connect(streamWsHost, streamWsPort, streamWsPath.c_str())) {
     wsConnected = false;
     Serial.println("[WS] 连接失败");
     Serial.printf("[WS] 连接失败后可用堆内存: %u\n", ESP.getFreeHeap());
@@ -1947,7 +1832,7 @@ void connectStreamWs() {
 }
 
 void sendStreamFrameIfReady() {
-  if (!wsClient.available() || !wsConnected) return;
+  if (!wsClient.available() || !wsConnected || !streamPushEnabled) return;
 
   unsigned long now = millis();
   if (now - lastFrameTime < streamInterval) return;

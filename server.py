@@ -1,6 +1,9 @@
 import asyncio
 import contextlib
+import json
+import os
 import time
+from urllib.parse import parse_qs, urlsplit
 from typing import Dict, Optional
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -12,8 +15,9 @@ except Exception:
     uvloop = None
 
 
-HOST = "0.0.0.0"
-PORT = 8081
+DEFAULT_ROOM = "cam01"
+HOST = os.environ.get("RELAY_HOST", "0.0.0.0")
+PORT = int(os.environ.get("RELAY_PORT", "8888"))
 VIEWER_QUEUE_SIZE = 1
 STATS_INTERVAL_SEC = 5.0
 SEND_TIMEOUT_SEC = 0.25
@@ -26,6 +30,29 @@ stats_started_at = time.monotonic()
 stats_frames = 0
 stats_bytes = 0
 stats_dropped = 0
+
+
+async def send_publisher_control(room: str, value: str) -> None:
+    global camera_ws
+
+    publisher = camera_ws
+    if publisher is None:
+        return
+
+    payload = json.dumps({"cmd": "stream", "value": value, "viewers": len(viewer_queues)})
+    try:
+        await asyncio.wait_for(publisher.send(payload), timeout=SEND_TIMEOUT_SEC)
+        print(f"[CTRL] room={room} stream={value} viewers={len(viewer_queues)}")
+    except (asyncio.TimeoutError, ConnectionClosed):
+        with contextlib.suppress(Exception):
+            await publisher.close(code=1011, reason="publisher_control_error")
+        if camera_ws == publisher:
+            camera_ws = None
+
+
+async def sync_publisher_stream_state(room: str) -> None:
+    value = "start" if viewer_queues else "stop"
+    await send_publisher_control(room, value)
 
 
 def report_stats(force: bool = False) -> None:
@@ -67,17 +94,25 @@ async def viewer_sender(websocket: ServerConnection, queue: asyncio.Queue[bytes]
             await websocket.close(code=1011, reason="viewer_send_error")
 
 
-async def handle_camera(websocket: ServerConnection) -> None:
+def parse_request_target(websocket: ServerConnection) -> tuple[str, str]:
+    raw_target = websocket.request.path
+    parsed = urlsplit(raw_target)
+    room = parse_qs(parsed.query).get("room", [DEFAULT_ROOM])[0].strip() or DEFAULT_ROOM
+    return parsed.path, room
+
+
+async def handle_camera(websocket: ServerConnection, room: str) -> None:
     global camera_ws, stats_frames, stats_bytes, stats_dropped
 
     async with camera_lock:
         if camera_ws is not None and camera_ws != websocket:
-            print("[CAM] 新推流连接到来，关闭旧连接")
+            print(f"[CAM] room={room} 新推流连接到来，关闭旧连接")
             with contextlib.suppress(Exception):
                 await camera_ws.close(code=1012, reason="camera_replaced")
         camera_ws = websocket
 
-    print("[CAM] 摄像头已连接，开始中转视频")
+    print(f"[CAM] room={room} 摄像头已连接，开始中转视频")
+    await sync_publisher_stream_state(room)
     try:
         async for message in websocket:
             if not isinstance(message, (bytes, bytearray)):
@@ -100,7 +135,7 @@ async def handle_camera(websocket: ServerConnection) -> None:
 
             report_stats(force=False)
     except ConnectionClosed:
-        print("[CAM] 摄像头连接断开")
+        print(f"[CAM] room={room} 摄像头连接断开")
     finally:
         report_stats(force=True)
         async with camera_lock:
@@ -108,33 +143,45 @@ async def handle_camera(websocket: ServerConnection) -> None:
                 camera_ws = None
 
 
-async def handle_viewer(websocket: ServerConnection) -> None:
+async def handle_viewer(websocket: ServerConnection, room: str) -> None:
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=VIEWER_QUEUE_SIZE)
     viewer_queues[websocket] = queue
     sender_task = asyncio.create_task(viewer_sender(websocket, queue))
 
-    print(f"[VIEW] 观众上线，当前人数: {len(viewer_queues)}")
+    print(f"[VIEW] room={room} 观众上线，当前人数: {len(viewer_queues)}")
+    await sync_publisher_stream_state(room)
     try:
-        await websocket.wait_closed()
+        async for message in websocket:
+            if not isinstance(message, str):
+                continue
+            publisher = camera_ws
+            if publisher is None:
+                continue
+            try:
+                await asyncio.wait_for(publisher.send(message), timeout=SEND_TIMEOUT_SEC)
+            except (asyncio.TimeoutError, ConnectionClosed):
+                with contextlib.suppress(Exception):
+                    await publisher.close(code=1011, reason="publisher_send_error")
     finally:
         sender_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sender_task
         viewer_queues.pop(websocket, None)
-        print(f"[VIEW] 观众离线，当前人数: {len(viewer_queues)}")
+        print(f"[VIEW] room={room} 观众离线，当前人数: {len(viewer_queues)}")
+        await sync_publisher_stream_state(room)
 
 
 async def video_relay(websocket: ServerConnection) -> None:
-    path = websocket.request.path
+    path, room = parse_request_target(websocket)
     if path == "/esp32":
-        await handle_camera(websocket)
+        await handle_camera(websocket, room)
         return
 
     if path == "/viewer":
-        await handle_viewer(websocket)
+        await handle_viewer(websocket, room)
         return
 
-    print(f"[WARN] 拒绝未知路径: {path}")
+    print(f"[WARN] room={room} 拒绝未知路径: {path}")
     await websocket.close(code=1008, reason="invalid_path")
 
 
